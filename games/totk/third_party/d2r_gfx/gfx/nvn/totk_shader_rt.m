@@ -45,6 +45,7 @@ static NSString *g_root, *g_dir;
    shader's .variants lists of both places are joined. nil on the Mac, where the seed is cloned into the cache. */
 static NSString *g_seed_dir;
 static NSSet<NSString *> *g_seed_names;
+static BOOL g_seed_all_default;   // seed-manifest.json all_default: every shader has its default variant (contrib_wanted)
 static uint64_t g_translated;
 /* The bottom-left box (nvn_mtl.m shader_overlay_prepare): variants new to the cache this run, when the last one came,
    and the variants in the cache (counted once in the background, plus the new ones since). */
@@ -81,6 +82,11 @@ NSString *totk_rt_dir(void) {
             NSDictionary *seed = totk_seed_import(source, g_dir, &error);
             totk_seed_progress = NULL;
             if ([seed[@"overlay"] isKindOfClass:NSArray.class]) { g_seed_dir = source; g_seed_names = [NSSet setWithArray:seed[@"overlay"]]; }
+            if ([seed[@"available"] boolValue]) {
+                NSData *md = [NSData dataWithContentsOfFile:[source stringByAppendingPathComponent:@"seed-manifest.json"]];
+                NSDictionary *m = md ? [NSJSONSerialization JSONObjectWithData:md options:0 error:nil] : nil;
+                g_seed_all_default = [m isKindOfClass:NSDictionary.class] && [m[@"all_default"] isEqual:@YES];
+            }
             if (!seed) {   // 2026-10-18: a damaged bundle or a full disk used to end the game here with nothing on screen. The
                            // cache stays usable (totk_seed_import writes shader files before the indexes that name them),
                            // so play on and translate shaders as they first appear, as before the prepared shaders existed.
@@ -320,6 +326,51 @@ static NSMutableDictionary *variant_request(NSString *shader, int stage, const u
     if (no_translator()) rq[@"code_hex"] = hex(code + skip, c1t - skip);
     return rq;
 }
+/* Whether a new variant goes into the contribution file (totk_shader_contrib.h). With a seed that translated every shader
+   for the default bind state (all_default, prepare_shader_seed.py), the shared list keeps only the states those variants
+   do not serve (user 2026-10-22): the shader's default variant is there and this is another one. A shader the build did
+   not find or could not translate is left out too: the list cannot make a build find it. Older seeds (Breath of the
+   Wild's): every new variant, as before. g_rt_lock held. */
+static NSString *default_variant(NSString *shader) {   // the default bind state's name, as prepare_shader_seed.py SUFFIX (no answers at all)
+    static NSString *suffix;
+    if (!suffix) {
+        uint8_t md[32]; NSData *ad = [json_string(@{@"tex": @{}, @"img": @{}, @"attr": @{}, @"fout": @{}}) dataUsingEncoding:NSUTF8StringEncoding];
+        CC_SHA256(ad.bytes, (CC_LONG)ad.length, md); suffix = [@"-" stringByAppendingString:hex(md, 6)];
+    }
+    return [shader stringByAppendingString:suffix];
+}
+static BOOL contrib_wanted(NSString *shader, NSString *variant) {
+    if (!g_seed_all_default) return YES;
+    NSString *builtin = default_variant(shader);
+    if ([variant isEqualToString:builtin]) return NO;
+    for (NSDictionary *v in variants_of(shader)) if ([v[@"variant"] isEqual:builtin]) return YES;
+    return NO;
+}
+/* nvn_mtl.m pso_contribute: the name a pipeline row gives "<variant>_b" so that another player's build has that variant.
+   A variant the seed makes from the code alone keeps its name (the default bind state; the depth-bound one of a shadow-map
+   shader, named after its depth slots only); any other is named as a build names a list row with its deps
+   (totk_contrib_listed_name), which the row the same variant added to the contribution file makes. */
+NSString *totk_rt_portable_variant(NSString *name) {
+    if (name.length < 66 || ![name hasSuffix:@"_b"]) return name;
+    NSString *variant = [name substringToIndex:name.length - 2], *shader = [variant substringToIndex:64];
+    if ([variant isEqualToString:default_variant(shader)]) return name;
+    pthread_mutex_lock(&g_rt_lock);
+    NSDictionary *deps = nil;
+    for (NSDictionary *v in variants_of(shader)) if ([v[@"variant"] isEqual:variant]) { deps = v[@"deps"]; break; }
+    pthread_mutex_unlock(&g_rt_lock);
+    if (![deps isKindOfClass:NSDictionary.class]) return name;
+    NSMutableDictionary *depth = [NSMutableDictionary dictionary];
+    NSDictionary *tex = [deps[@"tex"] isKindOfClass:NSDictionary.class] ? deps[@"tex"] : @{};
+    for (NSString *slot in tex) if ([tex[slot] isEqual:@"*_depth"]) depth[slot] = @"*_depth";
+    if (depth.count && [variant isEqualToString:totk_contrib_listed_name(shader, @{@"tex": depth})]) return name;
+    return [totk_contrib_listed_name(shader, deps) stringByAppendingString:@"_b"];
+}
+int totk_rt_contrib_on(void) { return totk_contrib_path() != nil; }
+void totk_rt_contrib_line(NSString *line) {   // totk_contrib_add_line under the lock its other writers hold
+    pthread_mutex_lock(&g_rt_lock);
+    totk_contrib_add_line(line);
+    pthread_mutex_unlock(&g_rt_lock);
+}
 /* No translator on the phone (Python + .NET + SPIRV-Cross): the variant cache is translated on the Mac and copied over.
    A miss records the complete request (with the guest code bytes) under shader-requests/ for ios/tools/fill_shaders.py.
    A miss no longer stops the game: the caller skips the draws / dispatches that need this variant (draw-skip reason
@@ -332,7 +383,7 @@ static void record_miss(NSString *shader, NSDictionary *rq, NSDictionary *answer
     if ([missed containsObject:variant]) return;
     [missed addObject:variant];
     [[json_string(rq) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:[NSString stringWithFormat:@"shader-requests/%@.json", variant] atomically:YES];
-    totk_contrib_add(shader, answers);   // not in the prepared seed, so not in the shared shader list yet
+    if (contrib_wanted(shader, variant)) totk_contrib_add(shader, answers);   // not in the prepared seed, so not in the shared shader list yet
     LOG("[shader-miss] %s %s 不在手机的翻译缓存里：跳过用到它的绘制，请求已存 shader-requests/（第 %lu 个；在 Mac 上 ios/tools/fill_shaders.py 补上后下次启动预热）",
         [rq[@"stage"] UTF8String], variant.UTF8String, (unsigned long)missed.count);
 }
@@ -365,7 +416,7 @@ static void variant_record(NSString *shader, NSDictionary *rq, NSDictionary *ref
     [[json_string(vs) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:index_path(shader) atomically:YES];
     g_translated++;
     if (!existed) { atomic_fetch_add(&g_new_variants, 1); atomic_store(&g_new_variant_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }   // discovered, translated, in the cache
-    if (!existed) totk_contrib_add(shader, refl[@"deps"] ?: @{});   // the seed would have had it if the shared list named it
+    if (!existed && contrib_wanted(shader, variant)) totk_contrib_add(shader, refl[@"deps"] ?: @{});   // the seed would have had it if the shared list named it
     if (getenv("TOTK_SURVEY_SHADER_LOG")) LOG("[survey-shader] frame %llu translated %s %s in %.2f ms%s%s",
         (unsigned long long)dm_nvn_frame_count(), [rq[@"stage"] UTF8String], variant.UTF8String,
         (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started) / 1e6,

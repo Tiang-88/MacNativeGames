@@ -72,6 +72,7 @@ TITLES = {'0100F2C0115B6000': 'totk', '01007EF00011E000': 'botw'}
 APPS = {'totk': ('Tears of the Kingdom', 'org.macnativegames.totk', 'TOTK'), 'botw': ('Breath of the Wild', 'org.macnativegames.botw', 'BotW')}
 HACTOOL = ('https://github.com/SciresM/hactool.git', '1d64a83450e025622f3468c28fc4164dad2c5ef6')
 APP_NAME = 'Tears of the Kingdom'
+IOS_APP_NAME = 'TOTK'   # the iPhone / iPad home screen name: "Tears of the Kingdom" was cut to "Tears of the…" (user 2026-10-22)
 BUNDLE_ID = 'org.macnativegames.totk'
 LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
 # Pinned upstream sources fetched at build time (repository, commit)
@@ -82,6 +83,15 @@ SPIRV_CROSS_SOURCES = ('main.cpp', 'spirv_cfg.cpp', 'spirv_cpp.cpp', 'spirv_cros
                        'spirv_reflect.cpp')
 SPIRV_CROSS_FLAGS = ('-O3', '-DNDEBUG', '-std=c++11', '-arch', 'arm64', '-Wno-deprecated-declarations')
 TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin']
+
+
+def contrib_folder():
+    """<clone>/shader-list-contribution (MNG_CONTRIB_FOLDER overrides): the one file players send, from the Mac and their
+    iPhones / iPads (app/launcher.m contrib_file, ios/tools/shader_contrib_watch.py). Made at build time if missing."""
+    folder = Path(os.environ.get('MNG_CONTRIB_FOLDER') or REPO / 'shader-list-contribution')
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
 
 # Nintendo's public ACID signing key (generation 0): a dump's main.npdm is genuine when this key verifies
 # its ACID signature, which is the check the Horizon loader itself makes before it starts a title
@@ -1118,16 +1128,29 @@ def data_bundle(tree, version, logs, *, bundle_id=BUNDLE_ID):
     """The RomFS image (16 GB) as a bundle of its own, signed once and kept in the work folder (build/data-bundles). The
     app carries a clone of it in Contents/Helpers, and the app's seal records only its signature: sealing the image
     inside the app hashed all 16 GB on every packaging (88 s on an M4 Mac mini, 2026-10-20), now only when the image
-    changed (the stamp names the image file: size, mtime, inode). The game opens the image through a link at its usual
-    place, extracted/<version>/romfs/romfs.bin, and checks its SHA-256 itself as before (runtime/romfs.c)."""
+    changed (the stamp names the image: size, mtime and the SHA-256 the extraction verified, extracted/<version>/romfs/
+    index.json). Not its inode, which an APFS clone of the work folder changes: a clone signed all 16 GB again (8 min on
+    the external disk, 2026-10-22). The game opens the image through a link at its usual place,
+    extracted/<version>/romfs/romfs.bin, and checks its SHA-256 itself as before (runtime/romfs.c)."""
     image = tree / f'extracted/{version}/romfs/romfs.bin'
     bundle = tree / f'build/data-bundles/GameData-{version}.bundle'
     stamp = bundle.with_name(bundle.name + '.json')
     st = image.stat()
-    want = dict(format=1, size=st.st_size, mtime_ns=st.st_mtime_ns, inode=st.st_ino)
     try:
-        if json.loads(stamp.read_text()) == want and (bundle / 'Contents/_CodeSignature/CodeResources').is_file():
-            return bundle
+        sha = json.loads((image.parent / 'index.json').read_text()).get('romfs_sha256')
+    except (OSError, ValueError):
+        sha = None
+    want = dict(format=2, size=st.st_size, mtime_ns=st.st_mtime_ns, sha256=sha) if sha else \
+        dict(format=1, size=st.st_size, mtime_ns=st.st_mtime_ns, inode=st.st_ino)
+    try:
+        have = json.loads(stamp.read_text())
+        if (bundle / 'Contents/_CodeSignature/CodeResources').is_file():
+            if have == want:
+                return bundle
+            if (want['format'] == 2 and have.get('format') == 1 and have.get('size') == st.st_size
+                    and have.get('mtime_ns') == st.st_mtime_ns):   # an older stamp (or a clone's: other inode, same file)
+                stamp.write_text(json.dumps(want))
+                return bundle
     except (OSError, ValueError):
         pass
     say('4/4 app: signing the game data once (a minute or two; later builds reuse it)')
@@ -1300,6 +1323,7 @@ def step_app(tree, out, logs, *, version="v0", game='totk'):
     if icon.exists():
         clone(icon, tmp / 'Contents/Resources/AppIcon.icns')
         info['CFBundleIconFile'] = 'AppIcon'
+    info['MNGContributionFolder'] = str(contrib_folder())   # app/launcher.m contrib_file: where players find it
     import plistlib
     (tmp / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
     (tmp / 'Contents/PkgInfo').write_bytes(b'APPL????')
@@ -1701,6 +1725,9 @@ def parse_args(argv):
     ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app (Breath of the Wild: the 1.9.0 update NSP, not for a card image)')
     ap.add_argument('--dlc', type=Path, action='append', metavar='DLC.nsp', help='Breath of the Wild 1.9.0 only: an add-on content (DLC) NSP; repeat for the second pack (01007EF00011F001, 01007EF00011F002); each is optional, and a pack left out is not in the app; 1.9.0 takes its packs from --dlc only, also when the game file is a card image')
     ap.add_argument('--platform', choices=('macos','ios'), default='macos', help='build a macOS app (default) or unsigned iPhone/iPad IPA')
+    ap.add_argument('--ios-game-data', choices=('app', 'documents'), default='app',
+                    help='iOS: carry the 17 GB RomFS image in the IPA (default), or leave it out for the app\'s Documents/GameData '
+                         '(ios/tools/install_device.py --game-data copies it there once; later builds install in minutes)')
     ap.add_argument('-k', '--keys', type=Path, required=True, help='your prod.keys')
     ap.add_argument('-o', '--out', type=Path, help=f'the app or IPA to write (default depends on --platform; next to the game file)')
     ap.add_argument('--work', type=Path, help='work folder (default: TOTK_build next to the game file)')
@@ -1730,8 +1757,8 @@ def main(argv):
         raise BuildError(f'no such file: {keys}')
     out = (args.out.expanduser().resolve() if args.out else game.parent / (f'{APP_NAME}.ipa' if args.platform=='ios' else f'{APP_NAME}.app'))
     work = (args.work.expanduser().resolve() if args.work else game.parent / 'TOTK_build')
-    if out.suffix.lower() != ('.ipa' if args.platform=='ios' else '.app'):
-        raise BuildError(f'the {args.platform} output must end in {".ipa" if args.platform=="ios" else ".app"}: {out}')
+    if out.suffix.lower() not in (('.ipa', '.app') if args.platform=='ios' else ('.app',)):   # iOS .app: unsigned folder for install_device.py
+        raise BuildError(f'the {args.platform} output must end in {".ipa or .app" if args.platform=="ios" else ".app"}: {out}')
     kind = input_kind(game)
     if kind not in ('xci', 'nsp'):
         raise BuildError('the base game must be an uncompressed XCI or NSP; NSZ is supported for update packages')
@@ -1851,6 +1878,8 @@ def main(argv):
             required=(60 if update else 45) if not base_cached else (40 if update else 18)
         else:
             required=(40 if update else 25) if not base_cached else (25 if update else 18)
+        if args.ios_game_data=='documents' and base_cached:
+            required=10   # the IPA carries no 17 GB image
         if free<required:
             raise BuildError(f'iOS build needs about {required} GB free on the work/output volume for the IPA archive')
         if not same_volume and output_free<18:
@@ -1881,12 +1910,14 @@ def main(argv):
     say(f'4/4 app: assembling {out}')
     if args.platform=='ios':
         run([py, 'ios/tools/build_ipa.py', '--tree', tree, '--out', out, '--version', version,
-             '--logs', logs, '--app-name', APP_NAME, '--bundle-id', BUNDLE_ID], logs/'build-ipa.log', cwd=tree, env=env)
+             '--logs', logs, '--app-name', IOS_APP_NAME, '--bundle-id', BUNDLE_ID,
+             *(['--image-outside'] if args.ios_game_data == 'documents' else [])], logs/'build-ipa.log', cwd=tree, env=env)
         if not args.no_shader_reminder:
             # The iOS app never asks during play; while the device is connected, this Mac asks to send the shaders the
             # shared list lacks (ios/tools/shader_contrib_watch.py). Not essential: a failure only says so.
             try:
-                run([py, 'ios/tools/shader_contrib_watch.py', 'install'], logs/'shader-contrib-watch.log', cwd=tree, env=env)
+                run([py, 'ios/tools/shader_contrib_watch.py', 'install', '--store', contrib_folder()],   # in this clone, where players look
+                    logs/'shader-contrib-watch.log', cwd=tree, env=env)
                 say('   installed the Mac reminder for iPhone / iPad shader contributions (remove: python3 '
                     'games/totk/ios/tools/shader_contrib_watch.py uninstall)')
             except BuildError as e:

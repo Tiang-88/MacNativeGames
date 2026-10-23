@@ -201,11 +201,9 @@ int hud_snapshot(int line, char *out, size_t n, int *highlight) {
 
 int shader_overlay_enabled(void) {
     static int on = -1;
-#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-    const int def = 0;   // the phone translates nothing (misses go to shader-requests/)
-#else
+    /* On by default on the iPhone too since it shows the render pipelines (user 2026-10-22: only the FPS was there when the
+       game was opened from the home screen); it was off there because the phone translates no shaders. */
     const int def = 1;
-#endif
     if (on < 0) { const char *e = getenv("TOTK_SHADER_OVERLAY"); on = e ? strcmp(e, "0") != 0 : def; }
     return on;
 }
@@ -215,6 +213,14 @@ void shader_overlay_text(char *out, size_t n, uint64_t fresh, int64_t total, uin
     (void)pipelines;   // user 2026-10-17: the pipeline count is not shown
     if (total < 0) snprintf(t, sizeof t, "--"); else snprintf(t, sizeof t, "%lld", (long long)(total > 999999 ? 999999 : total));
     snprintf(out, n, TOTK_UI("新着色器 %llu / 总计 %s", "New shaders %llu / total %s"), (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
+}
+/* The render pipeline line under the shaders (user 2026-10-22: "fps和着色器下面 现在显示渲染管线 信息，新/总计"): pipelines
+   this run built that this profile had never built (new to its warm list), and every render pipeline ready this run
+   (warm-up and play). */
+void pso_overlay_text(char *out, size_t n, uint64_t fresh, int64_t total) {
+    char t[16];
+    if (total < 0) snprintf(t, sizeof t, "--"); else snprintf(t, sizeof t, "%lld", (long long)(total > 999999 ? 999999 : total));
+    snprintf(out, n, TOTK_UI("新渲染管线 %llu / 总计 %s", "New render pipelines %llu / total %s"), (unsigned long long)(fresh > 99999 ? 99999 : fresh), t);
 }
 
 /* A count's rate, re-measured every half second (game presents; interpolated frames shown). stale_s > 0: a gap longer
