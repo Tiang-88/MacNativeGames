@@ -728,6 +728,10 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  case 0x0e: r[0]=0;r[1]=0;r[2]=15;return 0;
  case 0x25: {uint64_t id;pthread_threadid_np(NULL,&id);r[0]=0;r[1]=id;return 0;}
  case 0x10:r[0]=0;return 0;
+ /* SynchronizePreemptionState: the SDK calls it after clearing ThreadLocalRegion disable_count (+0x100) when interrupt_flag
+    (+0x102) was set by a preemption that had to wait (threads.c totk_preempt_signal). The switch itself happened at this
+    SVC's entry (runtime_core_checkpoint); here the flag is cleared, as Horizon does. */
+ case 0x36:{volatile uint16_t *tlr=pthread_getspecific(runtime_keys[2]);if(tlr)tlr[0x102/2]=0;r[0]=0;return 0;}
  case 0x26: {uint32_t result=0;if(r[1]&&r[2]>=4)memcpy(&result,(void *)(uintptr_t)r[1],4);fprintf(stderr,"[totk] guest Break reason=%llx result=%x\n",(unsigned long long)r[0],result);
   if(!(r[0]&0x80000000ULL)){fprintf(stderr,"[totk] break regs:");for(int i=0;i<31;i++)fprintf(stderr," x%d=%llx",i,(unsigned long long)r[i]);uint64_t sp=(uint64_t)((uint64_t *)r)[100];fprintf(stderr," sp=%llx\n",(unsigned long long)sp);
    const uint64_t *st=(const uint64_t *)(uintptr_t)sp;for(int i=0;i<32;i++)fprintf(stderr,"[totk] sp+%03x=%llx\n",i*8,(unsigned long long)st[i]);

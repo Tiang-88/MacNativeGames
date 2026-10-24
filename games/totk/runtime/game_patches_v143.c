@@ -462,9 +462,8 @@ static void render_res_publish(unsigned canvas_w){
    - Mac: the scene is the canvas's size, 1920x1080 on the 1080p canvas (the docked mode's own is 1600x900) and 2560x1440
      on the 2K one (key 3), only ever up (the Mac never lowers resolution). The heaps grow with it (romfs.c picks the
      <canvas>-scene-<size> HeapDef overlay build_app.py makes; the application pool follows).
-   - iPhone / iPad: 960x540 under the 1280x720 canvas, the game's own upscale (FSR 1 EASU, a3a570eb / ac58fc18) drawing it
-     there (user 2026-10-23: no MetalFX on the phone, as Breath of the Wild): the phone's GPU and memory are at their
-     limit; the same size as on the old port (2026-10-16, GPU 24.3 -> 17.3 ms, measured with MetalFX upscaling).
+   - iPhone / iPad: 960x540 under the 1280x720 canvas, MetalFX upscaling it (totk_mfx_up.m, on by default there): the
+     phone's GPU and memory are at their limit; the same choice as on the old port (2026-10-16, GPU 24.3 -> 17.3 ms).
    TOTK_RENDER_RES=<w>x<h> sets a size, =0 the game's own (no patch on the Mac; 1280x720 on the phone). */
 static int render_res(unsigned *w,unsigned *h){
     const char *e=getenv("TOTK_RENDER_RES");

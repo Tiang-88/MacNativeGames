@@ -11,36 +11,11 @@
 #include "game_patches.h"
 #include "game_version.h"
 #include "aspect_math.h"   /* key 4: TOTK_ASPECT parsing */
-#include <TargetConditionals.h>
 uint32_t runtime_thread_current_handle(void);
 static void botw_aspect_install(Module *m);   /* key 4, end of the file */
 static int patch_output_res(Module *m);   /* native output size, after runtime_output_res */
 static void botw_output_tick(void);       /* the size static follows the canvas after the start */
 static void botw_aspect_apply(void);
-
-/* iOS cannot write code pages at run time: the iOS export (TOTK_EXPORT_IOS, runtime/loader.c export-ios) runs these
-   patches on the Mac, and the patched text and patch area are embedded in the app (ios/tools/gen_embed.py), as for
-   Tears of the Kingdom (game_patches.c). On the device the original words are not checked (they are patched already) and
-   each patched word is checked instead of written. The switches that leave a patch out (TOTK_REALTIME=0,
-   TOTK_PAD_REPEAT=0, TOTK_RENDER_RES=900, TOTK_EXCL_ACQUIRE=0), the brk diagnostics (TOTK_PAD_LOG, TOTK_JQ_CHECK) and the
-   native output size (TOTK_OUTPUT_RES) are Mac only; the export ignores them too, so the device checks what it made. */
-#if TARGET_OS_IPHONE
-#define CODE_PATCHED_AT_BUILD 1
-#else
-#define CODE_PATCHED_AT_BUILD 0
-#endif
-static int ios_code(void) { return CODE_PATCHED_AT_BUILD || getenv("TOTK_EXPORT_IOS") != NULL; }   /* the phone's code */
-static void put_words(Module *m, uint64_t off, const uint32_t *words, size_t n, const char *what) {
-    if (!CODE_PATCHED_AT_BUILD) { memcpy(m->base + off, words, 4 * n); return; }
-    for (size_t i = 0; i < n; i++) {
-        uint32_t have; memcpy(&have, m->base + off + 4 * i, 4);
-        if (have != words[i]) {
-            fprintf(stderr, "[botw] %s main+%#llx: embedded %08x, expected patched %08x\n", what, (unsigned long long)(off + 4 * i), have, words[i]);
-            runtime_fail("embedded main text was not patched at build time (ios/tools/build_ipa.py export-ios)");
-        }
-    }
-}
-static void put_word(Module *m, uint64_t off, uint32_t word, const char *what) { put_words(m, off, &word, 1, what); }
 
 /* Real-time frame step (TOTK_REALTIME=0: as shipped). ksys::VFR (singleton pointer main+0x2d1e170, built at main+0x183eb98)
    keeps one frame ratio at +0x3c: the frame's length in 30 fps frames. Every per-core step the game reads derives from it:
@@ -91,7 +66,7 @@ static int g_pad_log_on; static _Atomic uint64_t g_pad_dir_until;   /* TOTK_PAD_
 static uint8_t *g_pad_main;
 #endif
 
-static int realtime_enabled(void) { const char *e = getenv("TOTK_REALTIME"); return ios_code() || !(e && !strcmp(e, "0")); }
+static int realtime_enabled(void) { const char *e = getenv("TOTK_REALTIME"); return !(e && !strcmp(e, "0")); }
 static uint64_t frame_step_bits(float seconds) {
     float ratio = seconds * 30.0f; uint32_t lo, hi;
     memcpy(&lo, &ratio, 4); memcpy(&hi, &seconds, 4);
@@ -258,7 +233,7 @@ static const uint32_t menu_cd_shipped[MENU_CD_WORDS] = { 0x8b0a136au, 0x5289400b
 static const uint32_t menu_cd_ticked[MENU_CD_WORDS] = { 0x8b0a136au, 0x9141914bu, 0, 0xb94009adu, 0x34000aedu, 0xb94a016cu, 0x5100058du, 0xb90a016du, 0x35000a6cu };
 static void pad_log_arm(Module *m) {
     const char *l = getenv("TOTK_PAD_LOG");
-    if (!l || !*l || !strcmp(l, "0") || ios_code()) return;
+    if (!l || !*l || !strcmp(l, "0")) return;
     /* diagnostics: a brk on the loop's first instruction (ldr w8, [x19, #0x100], the same shipped and patched), see botw_pad_hook */
     uint32_t b = 0xd4200000u | (0x7c0u << 5); memcpy(m->base + PAD_LOOP, &b, 4);
     g_pad_main = m->base; g_pad_log_on = 1;
@@ -266,15 +241,15 @@ static void pad_log_arm(Module *m) {
 }
 static void patch_pad_repeat(Module *m, uint64_t page) {
     const char *e = getenv("TOTK_PAD_REPEAT");
-    if (!ios_code() && e && !strcmp(e, "0")) { fprintf(stderr, "[botw] pad repeat and hold counts per frame, as shipped (TOTK_PAD_REPEAT=0)\n"); pad_log_arm(m); return; }
-    for (unsigned i = 0; !CODE_PATCHED_AT_BUILD && i < PAD_LOOP_WORDS; i++) {
+    if (e && !strcmp(e, "0")) { fprintf(stderr, "[botw] pad repeat and hold counts per frame, as shipped (TOTK_PAD_REPEAT=0)\n"); pad_log_arm(m); return; }
+    for (unsigned i = 0; i < PAD_LOOP_WORDS; i++) {
         uint32_t w; memcpy(&w, m->base + PAD_LOOP + 4 * i, 4);
         if (w != pad_loop_shipped[i]) {
             fprintf(stderr, "[botw] pad repeat main+%#x: found %08x expected %08x\n", PAD_LOOP + 4 * i, w, pad_loop_shipped[i]);
             runtime_fail("pad repeat by real time requires the 1.6.0 sead::ControllerBase loop");
         }
     }
-    for (unsigned i = 0; !CODE_PATCHED_AT_BUILD && i < MENU_CD_WORDS; i++) {
+    for (unsigned i = 0; i < MENU_CD_WORDS; i++) {
         uint32_t w; memcpy(&w, m->base + MENU_CD + 4 * i, 4);
         if (w != menu_cd_shipped[i]) {
             fprintf(stderr, "[botw] menu countdown main+%#x: found %08x expected %08x\n", MENU_CD + 4 * i, w, menu_cd_shipped[i]);
@@ -285,11 +260,11 @@ static void patch_pad_repeat(Module *m, uint64_t page) {
     atomic_store(pad_tick, 1);
     for (unsigned i = 0; i < PAD_LOOP_WORDS; i++) {
         uint32_t w = i == PAD_ADRP ? adrp_reg(16, (uintptr_t)m->base + PAD_LOOP + 4 * i, page) : pad_loop_ticked[i];
-        put_word(m, PAD_LOOP + 4 * i, w, "pad repeat");
+        memcpy(m->base + PAD_LOOP + 4 * i, &w, 4);
     }
     for (unsigned i = 0; i < MENU_CD_WORDS; i++) {
         uint32_t w = i == MENU_CD_ADRP ? adrp_reg(13, (uintptr_t)m->base + MENU_CD + 4 * i, page) : menu_cd_ticked[i];
-        put_word(m, MENU_CD + 4 * i, w, "menu countdown");
+        memcpy(m->base + MENU_CD + 4 * i, &w, 4);
     }
     fprintf(stderr, "[botw] pad repeat and hold counts by real time: held buttons count once per 1/30 s of game time, and so does "
                     "the pause menu's fast-repeat countdown (%u + %u instructions, all verified; TOTK_PAD_REPEAT=0: once per frame, as shipped)\n",
@@ -310,7 +285,7 @@ static void patch_realtime(Module *m) {
         {0x18522fcu, 0x1e2c1001u}, {0x1852300u, 0x1e210800u}, {0x1852304u, 0xbd0b22a0u},
         {0x161847cu, 0x1e290908u}, {0x1618480u, 0xbd400109u}, {0x1618484u, 0xb94c3680u},
     };
-    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
+    for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
         uint32_t w; memcpy(&w, m->base + check[i].off, 4);
         if (w != check[i].original) {
             fprintf(stderr, "[botw] real-time frame step main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
@@ -327,7 +302,7 @@ static void patch_realtime(Module *m) {
         {0x18522f4u, nop}, {0x18522f8u, nop}, {0x1852300u, nop},
         {0x1618480u, 0x1e2e1009u},   /* fmov s9, #1.0: six physics substeps per frame at any frame rate */
     };
-    for (size_t i = 0; i < sizeof put / sizeof *put; i++) put_word(m, put[i].off, put[i].word, "real-time step");
+    for (size_t i = 0; i < sizeof put / sizeof *put; i++) memcpy(m->base + put[i].off, &put[i].word, 4);
     frame_step_main = m->base;
     frame_step_data = (_Atomic uint64_t *)(void *)(m->base + data_off);
     atomic_store(frame_step_data, frame_step_bits(1.0f / 30.0f));
@@ -366,11 +341,11 @@ static void patch_realtime(Module *m) {
    the patched ratio makes it real-time too. */
 static void patch_pad_repeat(Module *m, uint64_t page) {
     const char *e = getenv("TOTK_PAD_REPEAT");
-    if (!ios_code() && e && !strcmp(e, "0")) { fprintf(stderr, "[botw] pad repeat and hold counts per frame, as shipped (TOTK_PAD_REPEAT=0)\n"); return; }
+    if (e && !strcmp(e, "0")) { fprintf(stderr, "[botw] pad repeat and hold counts per frame, as shipped (TOTK_PAD_REPEAT=0)\n"); return; }
     static const struct { uint32_t off, original; } check[] = {
         {0xeb0f78u, 0xd00075e8u}, {0xeb0f7cu, 0xaa1f03f5u}, {0xeb0f80u, 0xf944f108u}, {0xeb0f84u, 0x52800036u}, {0xeb0f88u, 0xbd400108u},
     };
-    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
+    for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
         uint32_t w; memcpy(&w, m->base + check[i].off, 4);
         if (w != check[i].original) {
             fprintf(stderr, "[botw] pad repeat main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
@@ -380,7 +355,7 @@ static void patch_pad_repeat(Module *m, uint64_t page) {
     const struct { uint32_t off, word; } put[] = {
         {0xeb0f78u, adrp_reg(8, (uintptr_t)m->base + 0xeb0f78, page)}, {0xeb0f80u, 0xd503201fu},
     };
-    for (size_t i = 0; i < sizeof put / sizeof *put; i++) put_word(m, put[i].off, put[i].word, "real-time step");
+    for (size_t i = 0; i < sizeof put / sizeof *put; i++) memcpy(m->base + put[i].off, &put[i].word, 4);
     fprintf(stderr, "[botw] pad repeat and hold counts by real time: held buttons count the VFR ratio per frame (%zu instructions, "
                     "%zu verified; TOTK_PAD_REPEAT=0: one per frame, as shipped)\n", sizeof put / sizeof *put, sizeof check / sizeof *check);
 }
@@ -397,7 +372,7 @@ static void patch_realtime(Module *m) {
         {0x1281064u, 0x97cc6dc9u}, {0x1281068u, 0xf94002a0u}, {0x128106cu, 0x1e204009u}, {0x1281070u, 0x97ccd7ceu},
         {0x1281080u, 0x1e204121u}, {0x1281084u, 0x940bba19u},
     };
-    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
+    for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
         uint32_t w; memcpy(&w, m->base + check[i].off, 4);
         if (w != check[i].original) {
             fprintf(stderr, "[botw] real-time frame step main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
@@ -412,7 +387,7 @@ static void patch_realtime(Module *m) {
         {0x1280eccu, adrp_reg(9, (uintptr_t)m->base + 0x1280ecc, page)}, {0x1280ee4u, 0xbd400120u},   /* ldr s0, [x9] */
         {0x128106cu, 0x1e2e1009u},   /* fmov s9, #1.0: six physics substeps per frame at any frame rate */
     };
-    for (size_t i = 0; i < sizeof put / sizeof *put; i++) put_word(m, put[i].off, put[i].word, "real-time step");
+    for (size_t i = 0; i < sizeof put / sizeof *put; i++) memcpy(m->base + put[i].off, &put[i].word, 4);
     frame_step_main = m->base;
     frame_step_data = (_Atomic uint64_t *)(void *)(m->base + data_off);
     atomic_store(frame_step_data, frame_step_bits(1.0f / 30.0f));
@@ -462,12 +437,12 @@ static struct { uint32_t state, status, ring; uint64_t jq; } g_pre[64];   /* per
    bit (ldaxr / ldaxp): one bit, the same registers and size, only stronger ordering. */
 static int excl_ld(uint32_t w) { return (w & 0x3ffffc00u) == 0x085f7c00u || (w & 0xbfff8000u) == 0x887f0000u; }   /* ldxr{b,h} / ldxp */
 static int excl_st(uint32_t w) { return (w & 0x3fe07c00u) == 0x08007c00u || (w & 0xbfe00000u) == 0x88200000u; }   /* st{l}xr{b,h} / st{l}xp */
-static unsigned excl_acquire(uint8_t *code, size_t n, int write) {   /* write 0: only count what is left */
+static unsigned excl_acquire(uint8_t *code, size_t n) {
     unsigned done = 0; uint32_t *w = (uint32_t *)(void *)code; size_t words = n / 4;
     for (size_t i = 0; i < words; i++) {
         if (!excl_ld(w[i])) continue;
         uint32_t rn = (w[i] >> 5) & 31;
-        for (size_t j = i + 1; j < words && j <= i + 16; j++) if (excl_st(w[j]) && ((w[j] >> 5) & 31) == rn) { if (write) w[i] |= 0x8000u; done++; break; }
+        for (size_t j = i + 1; j < words && j <= i + 16; j++) if (excl_st(w[j]) && ((w[j] >> 5) & 31) == rn) { w[i] |= 0x8000u; done++; break; }
     }
     return done;
 }
@@ -489,7 +464,7 @@ enum { RENDER_MOVK = 0x12660c8 };
 #endif
 static void patch_render_1080(Module *m) {
     const char *e = getenv("TOTK_RENDER_RES");
-    if (!ios_code() && e && !strcmp(e, "900")) { fprintf(stderr, "[botw] docked render size 1600x900, as shipped (TOTK_RENDER_RES=900)\n"); return; }
+    if (e && !strcmp(e, "900")) { fprintf(stderr, "[botw] docked render size 1600x900, as shipped (TOTK_RENDER_RES=900)\n"); return; }
     static const struct { uint32_t off, original; } check[] = {
 #ifdef GAME_BOTW160
         {0x1821670u, 0xd2a89e08u}, {0x1821674u, 0xf2e89908u}, {0x1821678u, 0xf9094b88u},
@@ -498,7 +473,7 @@ static void patch_render_1080(Module *m) {
         {0x12660ccu, 0xf9090a68u},
 #endif
     };
-    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
+    for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
         uint32_t w; memcpy(&w, m->base + check[i].off, 4);
         if (w != check[i].original) {
             fprintf(stderr, "[botw] render size main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
@@ -506,57 +481,22 @@ static void patch_render_1080(Module *m) {
         }
     }
     const uint32_t movk = 0xf2e89e08u;   /* movk x8, #0x44f0, lsl #48 */
-    put_word(m, RENDER_MOVK, movk, "docked render size");
+    memcpy(m->base + RENDER_MOVK, &movk, 4);
     fprintf(stderr, "[botw] docked render size 1920x1080 (shipped: 1600x900; TOTK_RENDER_RES=900 keeps it)\n");
-}
-/* The phone's render size (user 2026-10-23: "内部960×540，输出 用默认 放大机制"): the iPhone / iPad runs the handheld
-   mode, whose branch of the 1.6.0 display-mode routine (jump table at main+0x26164f8: mode 1 -> main+0x18216c8) stores
-   the screen width 1280.0 and the render width 1280.0 as one pair:
-     main+0x18216c8  mov x8, #0x44a00000              (1280.0, the screen)
-     main+0x18216cc  movk x8, #0x44a0, lsl #48        (1280.0, the render width) -> movk x8, #0x4470, lsl #48 (960.0)
-   The renderer scales its targets by render / screen width, as docked play does at 1600 / 1920, so the scene is drawn at
-   960x540 and the game's own upscale draws it into the 1280x720 canvas (MetalFX does not replace it on the phone:
-   totk_mfx_up.m mfxup_enabled).
-   1.9.0: the display-mode routine main+0x1266074 jumps by a byte table (main+0x1725916, base main+0x12660bc): mode 1 ->
-   main+0x1266114, the same pair (str x8, [x19, #0x1210]); mode 3 (VR) computes its own and is left alone:
-     main+0x1266114  mov x8, #0x44a00000
-     main+0x1266118  movk x8, #0x44a0, lsl #48        -> movk x8, #0x4470, lsl #48 (960.0)
-   (its dynamic-resolution scale, main+0x12661e8, divides the render width +0x1214 by 1280.0 in handheld: 0.75). */
-#ifdef GAME_BOTW160
-enum { PHONE_RENDER = 0x18216c8u, PHONE_RENDER_STR = 0xf9094b88u };   /* str x8, [x28, #0x1290] */
-#else
-enum { PHONE_RENDER = 0x1266114u, PHONE_RENDER_STR = 0xf9090a68u };   /* str x8, [x19, #0x1210] */
-#endif
-static void patch_phone_render(Module *m) {
-    if (!ios_code()) return;
-    const struct { uint32_t off, original; } check[] = {{PHONE_RENDER, 0xd2a89408u}, {PHONE_RENDER + 4, 0xf2e89408u}, {PHONE_RENDER + 8, PHONE_RENDER_STR}};
-    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
-        uint32_t w; memcpy(&w, m->base + check[i].off, 4);
-        if (w != check[i].original) {
-            fprintf(stderr, "[botw] handheld render size main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
-            runtime_fail("the phone's render size requires the " TOTK_GAME_VERSION " handheld display-mode instructions");
-        }
-    }
-    put_word(m, PHONE_RENDER + 4, 0xf2e88e08u, "handheld render size");   /* movk x8, #0x4470, lsl #48: 960.0 */
-    fprintf(stderr, "[botw] handheld render size 960x540, the game's own upscale to the 1280x720 canvas (phone)\n");
 }
 void runtime_game_patches(Module *m) {
     fprintf(stderr, "[botw] %s game-code patches\n", TOTK_GAME_VERSION);
     runtime_survey_init(m);   /* TOTK_SURVEY=1: survey pos / move (world_survey.c) */
     if (!patch_output_res(m)) patch_render_1080(m);
-    patch_phone_render(m);
     botw_aspect_install(m);
     if (realtime_enabled()) patch_realtime(m);
     else fprintf(stderr, "[botw] real-time frame step off (TOTK_REALTIME=0): the game advances by its present interval\n");
     { const char *a = getenv("TOTK_EXCL_ACQUIRE");
-      if (ios_code() || !a || strcmp(a, "0")) {
-          const int w = !CODE_PATCHED_AT_BUILD;   /* the device: the export set them all, in the text and the patch area */
-          unsigned t = excl_acquire(m->base, m->text_end, w), p = excl_acquire(m->base + m->patch_off, m->file_size - m->patch_off, w);
-          if (!w && (t || p)) { fprintf(stderr, "[botw] %u + %u exclusive loads without acquire in the embedded code\n", t, p); runtime_fail("embedded main text was not patched at build time (ios/tools/build_ipa.py export-ios)"); }
-          if (!w) fprintf(stderr, "[botw] exclusive loads with acquire: set at build time (iOS), none left\n"); else
+      if (!a || strcmp(a, "0")) {
+          unsigned t = excl_acquire(m->base, m->text_end), p = excl_acquire(m->base + m->patch_off, m->file_size - m->patch_off);
           fprintf(stderr, "[botw] exclusive loads with acquire: %u in the code, %u in the rewriter's patch area (TOTK_EXCL_ACQUIRE=0: as shipped)\n", t, p);
       } else fprintf(stderr, "[botw] exclusive loads as shipped (TOTK_EXCL_ACQUIRE=0)\n"); }
-    const char *e = getenv("TOTK_JQ_CHECK"); if (!e || !*e || !strcmp(e, "0") || ios_code()) return;
+    const char *e = getenv("TOTK_JQ_CHECK"); if (!e || !*e || !strcmp(e, "0")) return;
     for (int i = 0; i < JQ_SITES; i++) { uint32_t w; memcpy(&w, m->base + g_jq_site[i].off, 4);
         if (w != g_jq_site[i].word) { fprintf(stderr, "[botw] TOTK_JQ_CHECK: main+%#x is %08x, not %08x (%s): not armed\n", g_jq_site[i].off, w, g_jq_site[i].word, g_jq_site[i].what); return; } }
     for (int i = 0; i < JQ_SITES; i++) { uint32_t b = 0xd4200000u | ((0x7a1u + (uint32_t)i) << 5); memcpy(m->base + g_jq_site[i].off, &b, 4); }
@@ -691,7 +631,6 @@ static _Atomic uint64_t *g_out_page;         /* the data page + 16: [0] {screen,
 static uint8_t *g_out_main;
 static void output_parse(void) {
     if (g_out_mode >= 0) return;
-    if (ios_code()) { g_out_mode = OUT_OFF; return; }   /* the phone: the game's own size (handheld 720p) */
     const char *e = getenv("TOTK_OUTPUT_RES"); unsigned a, b; char tail;
     if (e && !strcmp(e, "0")) { g_out_mode = OUT_OFF; return; }
     if (!e || !*e || !strcmp(e, "auto")) { g_out_mode = OUT_AUTO; g_out_w = 2560; g_out_h = 1440; return; }
@@ -758,7 +697,7 @@ static int patch_output_res(Module *m) {
         memcpy(&word, m->base + size_init[i], 4); uint32_t k; memcpy(&k, m->base + size_init[i] + 12, 4);
         if (word != 0xd280f009u || k != 0xf2c08709u) { fprintf(stderr, "[botw] output size main+%#x: %08x / %08x\n", size_init[i], word, k); runtime_fail("the output size requires the 1.6.0 size initialisers"); }
     }
-    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
+    for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
         memcpy(&word, m->base + check[i].off, 4);
         if (word != check[i].original) { fprintf(stderr, "[botw] output size main+%#x: found %08x expected %08x\n", check[i].off, word, check[i].original); runtime_fail("the output size requires the 1.6.0 display-mode and heap instructions"); }
     }
@@ -886,7 +825,7 @@ static void botw_aspect_writer(Module *m) {
     static const uint32_t original[14] = {0x39010277, 0xb9406ec8, 0xb900d268, 0x39010277, 0xb94072c8, 0xb900d668, 0x39010277,
                                           0x2d4806a0, 0x2d470ea2, 0x39010277, 0x1e233821, 0x1e223800, 0x1e211800, 0xbd00ea60};
     const uint32_t at = 0x15c2118;
-    for (int i = 0; !CODE_PATCHED_AT_BUILD && i < 14; i++) {
+    for (int i = 0; i < 14; i++) {
         uint32_t w; memcpy(&w, m->base + at + 4 * i, 4);
         if (w != original[i]) { fprintf(stderr, "[botw] ultrawide main+%#x: found %08x expected %08x\n", at + 4 * i, w, original[i]); runtime_fail("ultrawide requires the 1.6.0 camera update"); }
     }
@@ -909,7 +848,7 @@ static void botw_aspect_writer(Module *m) {
         0x39010277,   /* strb w23, [x19, #0x40]       dirty */
         0xbd00ea60,   /* str s0, [x19, #0xe8]         the aspect */
     };
-    put_words(m, at, patched, 14, "ultrawide aspect writer");
+    memcpy(m->base + at, patched, sizeof patched);
     g_uw_word = (_Atomic uint32_t *)(void *)(page + 0x20);
 }
 static void botw_aspect_word(int on) { float v = on ? g_uw_wide : 0.0f; uint32_t b; memcpy(&b, &v, 4); if (g_uw_word) atomic_store(g_uw_word, b); }
@@ -917,15 +856,12 @@ static void botw_aspect_word(int on) { float v = on ? g_uw_wide : 0.0f; uint32_t
 static void botw_aspect_writer(Module *m) { (void)m; }
 static void botw_aspect_word(int on) { (void)on; }
 #endif
-static float g_uw_view;                  /* runtime_aspect_view, below */
-static void botw_aspect_phone(float a);
 static void botw_aspect_install(Module *m) {
     float start = aspect_requested();
     g_uw_wide = start ? start : (float)ASPECT_WIDE;
     g_uw_main = m->base; atomic_store(&g_uw_on, start != 0);
     botw_aspect_writer(m); botw_aspect_word(start != 0);
     fprintf(stderr, "[botw] ultrawide: key 4 switches 16:9 / %.4f (TOTK_ASPECT), starts %s\n", g_uw_wide, start ? "wide" : "at 16:9");
-    if (g_uw_view > 0) botw_aspect_phone(g_uw_view);   /* the phone's screen was reported first */
 }
 static void botw_aspect_apply(void) {
     if (!g_uw_main) return;
@@ -960,35 +896,10 @@ float runtime_aspect_now(void) { return g_uw_main && atomic_load(&g_uw_on) && at
 int runtime_aspect_toggle(void) {
     if (!g_uw_main) return 0;
     int on = !atomic_load(&g_uw_on); atomic_store(&g_uw_on, on); botw_aspect_word(on);
-#if !TARGET_OS_IPHONE
-    runtime_front_resize_aspect(on ? g_uw_wide : ASPECT_GAME);
-#endif
     fprintf(stderr, "[botw] key 4: aspect ratio %s\n", on ? "wide" : "16:9 (the game's own)");
     return 1;
 }
 /* Upstream's key 4 (#120) cycles 16:9 -> fit to the window -> 21:9 for TOTK; here key 4 switches 16:9 / wide only, so
    the panel sees step 0 or 2 and the window size is not followed. */
 int runtime_aspect_step(void) { return g_uw_main ? (atomic_load(&g_uw_on) ? 2 : 0) : -1; }
-/* iPhone (frontend_ios.m reports the drawable once the view is made): the phone fills its screen as Tears of the Kingdom
-   does there (aspect_patch.h, user 2026-10-23 "iphone 全屏"): key 4's wide ratio becomes the screen's shape (2.16 on an
-   iPhone 14) and is on from the start, so the camera draws that view into the 1280x720 canvas, the present widens it over
-   the screen and the UI is squeezed back to 16:9 (uw_ui_squeeze). No extra memory. A screen not wider than 16:9 (an iPad)
-   keeps the game's 16:9 with bars; TOTK_ASPECT=0 (or 16:9) keeps it everywhere. Mac: the window does not change key 4. */
-/* g_uw_view: the drawable's shape, which may come before the main module is patched (botw_aspect_install takes it then). */
-static void botw_aspect_phone(float a) {
-#if TARGET_OS_IPHONE
-    const char *e = getenv("TOTK_ASPECT");
-    if ((e && (!strcmp(e, "0") || !strcmp(e, "16:9"))) || !(a > 16.0f / 9.0f * 1.01f) || a > 8.0f) {
-        fprintf(stderr, "[botw] screen shape %.4f: the game's 16:9%s\n", a, e && *e ? " (TOTK_ASPECT)" : ""); return;
-    }
-    g_uw_wide = a; atomic_store(&g_uw_on, 1); botw_aspect_word(1);
-    fprintf(stderr, "[botw] full screen: the camera takes the screen's shape %.4f (TOTK_ASPECT=0: 16:9)\n", a);
-#else
-    (void)a;
-#endif
-}
-void runtime_aspect_view(double w, double h) {
-    if (!(w > 0 && h > 0)) return;
-    g_uw_view = (float)(w / h);
-    if (g_uw_main) botw_aspect_phone(g_uw_view);
-}
+void runtime_aspect_view(double w, double h) { (void)w; (void)h; }
