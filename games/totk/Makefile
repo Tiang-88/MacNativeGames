@@ -362,6 +362,60 @@ build/totk-native-v121: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) build
 	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V121=1 -Ibuild/v121 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
 runtime-v121: build/totk-native-v121 build/pso_manifest.tsv build/pso_title.tsv
 
+# Player exlaunch subsdk1 (Merged/exefs) as a real fourth module: separate headers, separate executable,
+# the official v121 outputs are only read. Module order is rtld (synthetic) -> main -> subsdk0 -> subsdk1 -> sdk.
+SUBSDK1_INPUT ?= $(abspath ../../../Merged/exefs/subsdk1)
+# UltraCam (超级相机) ships as subsdk3 in the same exefs. Same rewriter, same ruleset.
+SUBSDK3_INPUT ?= $(abspath ../../../Merged/exefs/subsdk3)
+.PHONY: rewrite-subsdk1 rewrite-subsdk3 synthetic-rtld-mod extracted-subsdk1
+rewrite-subsdk1:
+	@mkdir -p rewritten/v121
+	DM_RULESET=native DM_PRIVATE_GATES=0 "$(PY)" third_party/d2r/patch_nso.py "$(SUBSDK1_INPUT)" rewritten/v121 subsdk1
+
+rewrite-subsdk3:
+	@mkdir -p rewritten/v121
+	DM_RULESET=native DM_PRIVATE_GATES=0 "$(PY)" third_party/d2r/patch_nso.py "$(SUBSDK3_INPUT)" rewritten/v121 subsdk3
+
+synthetic-rtld-mod:
+	"$(PY)" scripts/make_synthetic_rtld.py --output rewritten/v121/rtld.patched.bin --fixups rewritten/v121/rtld.fixups.tsv
+
+extracted-subsdk1:
+	"$(PY)" scripts/prepare_modules.py --module subsdk1="$(SUBSDK1_INPUT)" --output extracted/v121-mod/elf
+
+build/v121-mod/runtime_tables.h: scripts/prepare_runtime.py analysis/v121-port/phase12-validation.json rewritten/v121/subsdk1.patched.bin rewritten/v121/rtld.patched.bin
+	"$(PY)" scripts/prepare_runtime.py --version v121 --mod
+build/totk-native-v121-mod: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) build/v121-mod/runtime_tables.h build/v121/romfs_config.h build/shared_fonts_config.h $(GFX_OBJECTS) Makefile
+	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V121=1 -DTOTK_MOD_SUBSDK1=1 -Ibuild/v121-mod -Ibuild/v121 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
+runtime-v121-mod: build/totk-native-v121-mod build/pso_manifest.tsv build/pso_title.tsv
+# UltraCam (超级相机, Merged/exefs/subsdk3) is a real sixth module: rtld -> main -> subsdk0 -> subsdk1 -> subsdk3 -> sdk.
+# Separate headers and a separate executable, so the validated Master Mode build is never touched.
+build/v121-uc/runtime_tables.h: scripts/prepare_runtime.py analysis/v121-port/phase12-validation.json rewritten/v121/subsdk1.patched.bin rewritten/v121/subsdk3.patched.bin rewritten/v121/rtld.patched.bin
+	"$(PY)" scripts/prepare_runtime.py --version v121 --mod --uc
+build/totk-native-v121-uc: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) build/v121-uc/runtime_tables.h build/v121/romfs_config.h build/shared_fonts_config.h $(GFX_OBJECTS) Makefile
+	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V121=1 -DTOTK_MOD_SUBSDK1=1 -DTOTK_MOD_SUBSDK3=1 -Ibuild/v121-uc -Ibuild/v121 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
+runtime-v121-uc: build/totk-native-v121-uc build/pso_manifest.tsv build/pso_title.tsv
+
+.PHONY: probe-mod probe-mod-init probe-mod-hooks
+# Pipeline + layout probe: maps all five modules at their arena addresses, then replays exlaunch's
+# FindModules QueryMemory state machine. No DT_INIT, no game entry. Negative control 30 reports every
+# address as one free run and must find no module.
+probe-mod: build/totk-native-v121-mod
+	build/totk-native-v121-mod rewritten/v121 probe-mod > analysis/native-probe-mod.json 2> analysis/native-probe-mod.log
+	@cat analysis/native-probe-mod.json
+	@if TOTK_PROBE_NEGATIVE=30 build/totk-native-v121-mod rewritten/v121 probe-mod > analysis/native-probe-mod-negative.json 2> analysis/native-probe-mod-negative.log; then echo "mod negative control passed unexpectedly"; exit 1; \
+	 elif grep -q 'FindModules found a different module count' analysis/native-probe-mod-negative.log; then echo "mod negative control (coarse free memory hides every module) failed as expected"; \
+	 else echo "mod negative control failed for an unexpected reason:"; tail -3 analysis/native-probe-mod-negative.log; exit 1; fi
+
+probe-mod-init: build/totk-native-v121-mod
+	build/totk-native-v121-mod rewritten/v121 probe-mod-init > analysis/native-probe-mod-init.json 2> analysis/native-probe-mod-init.log
+	@cat analysis/native-probe-mod-init.json
+
+# Runs the real subsdk1 DT_INIT 0x4120 through exlaunch main 0x53a4: all ten v121 hooks must be
+# visible at their executable source, then one synthetic inline hook is dispatched end to end.
+probe-mod-hooks: build/totk-native-v121-mod
+	build/totk-native-v121-mod rewritten/v121 probe-mod-hooks > analysis/native-probe-mod-hooks.json 2> analysis/native-probe-mod-hooks.log
+	@cat analysis/native-probe-mod-hooks.json
+
 # Isolated 1.4.3 build; never replace the validated v0 executable or generated headers.
 .PHONY: runtime-v143
 build/v143/runtime_tables.h: scripts/prepare_runtime.py analysis/v143-port/phase12-validation.json

@@ -214,13 +214,23 @@ def prepare(source, destination):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('exefs', type=Path)
+    parser.add_argument('exefs', type=Path, nargs='?')
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--module', action='append', default=[], metavar='NAME=PATH',
+                        help='inventory NAME from PATH instead of the exefs directory (repeatable)')
     args = parser.parse_args()
+    overrides = {}
+    for item in args.module:
+        name, sep, path = item.partition('=')
+        if not sep or not name or not path:
+            parser.error('--module expects NAME=PATH')
+        overrides[name] = Path(path)
+    if not overrides and args.exefs is None:
+        parser.error('give an exefs directory or at least one --module')
     args.output.mkdir(parents=True, exist_ok=True)
     inventory = []
-    for name in ['rtld', 'main', 'sdk', 'subsdk0']:
-        result = prepare(args.exefs / name, args.output / (name + '.elf'))
+    for name in (list(overrides) if overrides else ['rtld', 'main', 'sdk', 'subsdk0']):
+        result = prepare(overrides.get(name, args.exefs / name), args.output / (name + '.elf'))
         (args.output / (name + '-inventory.json')).write_text(json.dumps(result, indent=2) + '\n')
         summary = {k: result[k] for k in ['module', 'build_id', 'needed', 'segment_hashes_verified']}
         summary.update(imports=len(result['imports']), exports=len(result['exports']),

@@ -48,7 +48,6 @@ int fps_overlay_toggle_hints(void) {
     while (!atomic_compare_exchange_weak_explicit(&g_hud_mode, &mode, next, memory_order_relaxed, memory_order_relaxed));
     return next;
 }
-
 int fps_overlay_enabled(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("TOTK_FPS_OVERLAY"); on = !(e && !strcmp(e, "0")); }

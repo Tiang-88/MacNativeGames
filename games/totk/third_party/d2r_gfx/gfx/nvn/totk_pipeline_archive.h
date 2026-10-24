@@ -50,7 +50,12 @@ static int par_fill_light(void) {
     const char *e = getenv("TOTK_PIPELINE_ARCHIVE_FILL"); return e && !strcmp(e, "1");
 #endif
 }
-static NSString *par_dir(void) { return [totk_rt_dir() stringByAppendingPathComponent:@"pipelines"]; }
+static NSString *par_dir(void) {
+    NSString *name = @"pipelines"; int fast = totk_msl_fast_mask();   // nvn_mtl.m: TOTK_MSL_FAST 的分段（0 = 关）| TOTK_MSL_FAST parts (0 = off)
+    if (fast) name = [name stringByAppendingFormat:@"-mslfast%d", fast];   // 改写源码编出的管线和 safe 的分开存 | pipelines built from rewritten source live apart
+    if (totk_early_z_on()) name = [name stringByAppendingString:@"-ez"];   // 带 [[early_fragment_tests]] 的函数编出的管线（nvn_mtl.m TOTK_EARLY_Z）| pipelines built from shaders that now declare early fragment tests
+    return [totk_rt_dir() stringByAppendingPathComponent:name];
+}
 static NSString *par_file(NSString *key) { return [par_dir() stringByAppendingFormat:@"/%@.metalarchive", key]; }
 static NSDictionary *par_identity(id<MTLDevice> dev) {
     return @{@"schema": @3, @"chain": @DMSH_CHAIN, @"gpu": dev.name ?: @"?",

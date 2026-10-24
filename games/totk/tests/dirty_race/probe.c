@@ -86,6 +86,32 @@ static void stamp_order(size_t pg) {
     EXPECT("#90: stamp before protect: the writes are seen", 1, nvn_dirty_since(page, 16, before));
     EXPECT("#90: stamp after protect (old order): the writes are missed", 0, nvn_dirty_since(page, 16, after));
 }
+/* TOTK_REPLAY_FAST: nvn_dirty_check（一次区间查找，整块 64 页的最高代号不超过戳就跳过）必须给出 nvn_dirty_tracked / nvn_dirty_since
+   相同的答案。300 页（5 块）的池，每轮在保护之间随机写几页，再用随机子区间和戳比较两种答案；对照：未跟踪的地址。
+   | must give nvn_dirty_tracked / nvn_dirty_since's answer. A 300-page pool (5 chunks) gets random writes in rounds between
+   protects; every round compares both over random sub-ranges and stamps. Control: an untracked address. */
+static void chunk_check(size_t pg) {
+    enum { NP = 300, ROUNDS = 40, QUERIES = 400 };
+    uint8_t *pool = mmap(NULL, NP * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (pool == MAP_FAILED) { perror("mmap"); g_fail++; return; }
+    nvn_dirty_add_range(pool, NP * pg);
+    uint64_t stamps[ROUNDS]; int diff = 0, dirty = 0, clean = 0; unsigned seed = 12345;
+    for (int rd = 0; rd < ROUNDS; rd++) {
+        stamps[rd] = nvn_dirty_now(); nvn_dirty_protect(pool, NP * pg);
+        int nw = (int)((seed = seed * 1103515245u + 12345u) >> 16) % 4;
+        for (int w = 0; w < nw; w++) { size_t pgi = ((seed = seed * 1103515245u + 12345u) >> 16) % NP; pool[pgi * pg + 8] ^= 1; }
+        for (int qn = 0; qn < QUERIES; qn++) {
+            size_t lo = ((seed = seed * 1103515245u + 12345u) >> 16) % (NP * pg), len = 1 + ((seed = seed * 1103515245u + 12345u) >> 16) % (NP * pg - lo);
+            uint64_t st = stamps[((seed = seed * 1103515245u + 12345u) >> 16) % (rd + 1)];
+            int want = nvn_dirty_tracked(pool + lo, len) ? nvn_dirty_since(pool + lo, len, st) : -1, got = nvn_dirty_check(pool + lo, len, st);
+            diff += want != got; dirty += want == 1; clean += want == 0;
+        }
+    }
+    EXPECT("块检查：与 tracked + since 不同的答案", 0, diff);
+    EXPECT("块检查：脏、净两种答案都出现过", 1, dirty > 100 && clean > 100);
+    uint8_t local[16];
+    EXPECT("块检查：未跟踪内存返回 -1（对照）", -1, nvn_dirty_check(local, sizeof local, 0));
+}
 
 #if defined(GAME_BOTW)
 /* BOTW: pool B starts on pool A's last page. B gets a range for its own pages only; a texture of B across the border is
@@ -164,6 +190,7 @@ int main(void) {
     EXPECT("an untouched one in between is clean", 0, nvn_dirty_since(many + (size_t)(MANY / 2) * pg, 16, s2));
     if (busy_protect(pg)) return 2;
     stamp_order(pg);
+    chunk_check(pg);
 #if defined(GAME_BOTW)
     overlap(pg);
 #endif

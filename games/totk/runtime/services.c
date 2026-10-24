@@ -1,5 +1,6 @@
 /* Horizon services reached by the current TOTK startup. Unknown operations fail. */
 #include "runtime.h"
+#include "game_version.h"
 #include <TargetConditionals.h>
 #include "ipc.h"
 #include <mach/mach.h>
@@ -11,6 +12,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <libkern/OSCacheControl.h>
 
 #include <time.h>
 #include <unistd.h>
@@ -37,14 +39,25 @@ static uint64_t alias_requested(void){const char *e=getenv("TOTK_ALIAS_GIB");uin
 static uint64_t alias_size(void){if(!alias_len)alias_len=alias_requested();return alias_len;}
 #define ALIAS_SIZE alias_size()
 #define LOW_SEARCH_FROM 0x300000000ULL
-#if TARGET_OS_IPHONE
-#define LOW_SIZE (HEAP_OFF+HEAP_CAP)   /* iOS: no slack after the heap cap; address space is scarce */
+#define ARENA_SIZE (0x40000000ULL)
+#ifdef TOTK_MOD_SUBSDK1
+#define ARENA_TAIL ARENA_SIZE   /* the module arena keeps the last GiB of the reservation */
 #else
-#define LOW_SIZE (6ULL<<30)
+#define ARENA_TAIL 0
+#endif
+#if TARGET_OS_IPHONE
+#define LOW_SIZE_MIN (HEAP_OFF+HEAP_CAP_DEFAULT+ARENA_TAIL)   /* iOS: no slack after the heap cap; address space is scarce */
+#else
+#define LOW_SIZE_MIN (6ULL<<30)
 #endif
 #define STACK_OFF 0x10000000ULL
 #define STACK_SIZE 0x10000000ULL
 #define HEAP_OFF (STACK_OFF+STACK_SIZE+0x10000000ULL)
+#ifdef TOTK_MOD_SUBSDK1
+/* The module arena is the tail of the reservation, so a reservation grown for a bigger pool leaves it room. */
+#define ARENA_OFF (low_size()-ARENA_SIZE)
+static uint64_t arena_used;
+#endif
 static uint8_t *alias_space,*low_space,*heap;
 static size_t heap_size;
 static unsigned char alias_pages[ALIAS_SIZE_MAX/4096];
@@ -61,7 +74,11 @@ static uint8_t user_exception_context[0x1000] __attribute__((aligned(0x1000)));
 #else
 #define GAME_PROGRAM_ID 0x0100f2c0115b6000ULL
 #endif
-#define HEAP_CAP (4ULL<<30)   /* 1.4.3 sets a 2.2 GiB heap during nninitStartup */
+#define HEAP_CAP_DEFAULT (4ULL<<30)   /* 1.4.3 sets a 2.2 GiB heap during nninitStartup */
+#define HEAP_CAP_MAX (16ULL<<30)   /* largest heap a raised pool can ask for */
+#ifdef TOTK_MOD_SUBSDK1
+_Static_assert(HEAP_OFF+HEAP_CAP_DEFAULT+ARENA_SIZE<=LOW_SIZE_MIN,"module arena must fit the smallest low reservation");
+#endif
 #define APP_POOL app_pool()
 static uint64_t app_pool(void){static uint64_t v;if(!v){const char *e=getenv("TOTK_APP_POOL");uint64_t extra=(runtime_output_res_extra_bytes()+0x1fffff)&~0x1fffffULL;
  v=e?strtoull(e,NULL,0):0xcd500000ULL+extra;if(!e&&extra)fprintf(stderr,"[totk] application pool %#llx: +%llu MiB for the bigger texture heaps (TOTK_OUTPUT_RES, TOTK_RENDER_RES)\n",(unsigned long long)v,(unsigned long long)(extra>>20));}return v;}
@@ -79,6 +96,24 @@ static uint8_t *reserve_fixed(uint64_t at,uint64_t size){
  return mach_vm_map(mach_task_self(),&a,size,0,VM_FLAGS_FIXED,MEMORY_OBJECT_NULL,0,FALSE,VM_PROT_NONE,VM_PROT_ALL,VM_INHERIT_DEFAULT)==KERN_SUCCESS?(uint8_t *)(uintptr_t)a:NULL;
 }
 #define GUEST_ALIGN (2ULL<<20)
+/* The heap ceiling follows the pool the game is told it owns, so raising TOTK_APP_POOL raises the game's main heap
+   instead of running into a fixed 4 GiB wall that svcSetHeapSize would refuse with an error the game cannot recover
+   from. Only the pool (a startup constant) sizes the reservation, so the reservation never moves after memory_init
+   has placed it; the heap bound additionally leaves room for the mapped images. Both keep the retail figures when the
+   pool is the default one. */
+static uint64_t low_size(void){
+ static uint64_t v;
+ if(!v){uint64_t cap=APP_POOL>HEAP_CAP_MAX?HEAP_CAP_MAX:APP_POOL;uint64_t need=HEAP_OFF+cap+ARENA_TAIL;v=need>LOW_SIZE_MIN?need:LOW_SIZE_MIN;}
+ return v;
+}
+static uint64_t heap_cap(void){
+ uint64_t by_pool=APP_POOL>runtime_image_bytes()?APP_POOL-runtime_image_bytes():0;
+ uint64_t cap=by_pool>HEAP_CAP_DEFAULT?by_pool:HEAP_CAP_DEFAULT;
+ if(cap>HEAP_CAP_MAX)cap=HEAP_CAP_MAX;
+ uint64_t room=low_size()-HEAP_OFF-ARENA_TAIL;
+ if(cap>room)cap=room;
+ return cap&~(GUEST_ALIGN-1);
+}
 /* Reserve size bytes in a free gap (2 MiB aligned). The end of the map is
    not reported, so the last gap is only tried; FIXED fails there with KERN_NO_SPACE when it reaches past the end. */
 static uint8_t *reserve_in_gap_from(uint64_t size,int log,uint64_t prev){
@@ -107,12 +142,12 @@ static void memory_init(void) {
     free gap that holds them. The free space depends on the device, so the alias region shrinks from the requested size
     to ALIAS_MIN_GIB before giving up (logging the free gaps); TOTK_ALIAS_GIB pins one size. */
  uint64_t want=alias_requested(),least=getenv("TOTK_ALIAS_GIB")?want:(ALIAS_MIN_GIB<<30);
- for(uint64_t a=want;a>=least&&!low_space;a-=1ULL<<30)if((low_space=reserve_in_gap(LOW_SIZE+a,0)))alias_len=a;
+ for(uint64_t a=want;a>=least&&!low_space;a-=1ULL<<30)if((low_space=reserve_in_gap(low_size()+a,0)))alias_len=a;
  if(!low_space){reserve_in_gap(UINT64_MAX,1);runtime_fail("reserve guest stack, heap and alias regions");}
- alias_space=low_space+LOW_SIZE;
+ alias_space=low_space+low_size();
 #else
  alias_space=reserve_fixed(ALIAS_SPACE_AT,ALIAS_SIZE);
- if(alias_space)for(uint64_t at=LOW_SEARCH_FROM;at+LOW_SIZE<=ALIAS_SPACE_AT&&!low_space;at+=1ULL<<30)low_space=reserve_fixed(at,LOW_SIZE);
+ if(alias_space)for(uint64_t at=LOW_SEARCH_FROM;at+low_size()<=ALIAS_SPACE_AT&&!low_space;at+=1ULL<<30)low_space=reserve_fixed(at,low_size());
  if(!low_space){
   /* macOS 27: the shared cache fills 0x1_8000_0000..0xF_C000_0000 and the system reserves ~24 GiB at a random place in
      0x70_0000_0000..2^39, so neither fixed region fits. As on iOS, put stack+heap and the alias region side by side in one
@@ -121,8 +156,8 @@ static void memory_init(void) {
   alias_space=NULL;
   uint64_t want=alias_requested(),least=getenv("TOTK_ALIAS_GIB")?want:(8ULL<<30);
   for(uint64_t g=want;!low_space;g-=4ULL<<30){
-   for(uint64_t at=LOW_SEARCH_FROM;at+LOW_SIZE+g<=GUEST_ADDRESS_LIMIT&&!low_space;at+=1ULL<<30)
-    if((low_space=reserve_fixed(at,LOW_SIZE+g)))alias_len=g;
+   for(uint64_t at=LOW_SEARCH_FROM;at+low_size()+g<=GUEST_ADDRESS_LIMIT&&!low_space;at+=1ULL<<30)
+    if((low_space=reserve_fixed(at,low_size()+g)))alias_len=g;
    if(g<least+(4ULL<<30))break;
   }
   if(!low_space){
@@ -131,24 +166,43 @@ static void memory_init(void) {
       startup queries exact gaps, then tries separate stack/heap and alias
       reservations (already supported by the original fixed layout). */
    for(uint64_t g=want;!low_space;g-=4ULL<<30){
-    if((low_space=reserve_in_gap(LOW_SIZE+g,0))){alias_space=low_space+LOW_SIZE;alias_len=g;break;}
+    if((low_space=reserve_in_gap(low_size()+g,0))){alias_space=low_space+low_size();alias_len=g;break;}
     /* Keep low below alias: GetInfo's ASLR span and QueryMemory use that order,
-       including an explicit TOTK_ALIAS_GIB smaller than LOW_SIZE. */
-    uint8_t *separate_low=reserve_in_gap(LOW_SIZE,0);
+       including an explicit TOTK_ALIAS_GIB smaller than the stack+heap reservation. */
+    uint8_t *separate_low=reserve_in_gap(low_size(),0);
     if(separate_low){
-     if((alias_space=reserve_in_gap_from(g,0,(uintptr_t)separate_low+LOW_SIZE))){low_space=separate_low;alias_len=g;break;}
-     mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)separate_low,LOW_SIZE);
+     if((alias_space=reserve_in_gap_from(g,0,(uintptr_t)separate_low+low_size()))){low_space=separate_low;alias_len=g;break;}
+     mach_vm_deallocate(mach_task_self(),(mach_vm_address_t)(uintptr_t)separate_low,low_size());
     }
     if(g<least+(4ULL<<30))break;
    }
   }
   if(!low_space)runtime_fail(getenv("TOTK_ALIAS_GIB")?"reserve guest stack, heap and the TOTK_ALIAS_GIB alias region below 2^39":"reserve guest stack, heap and alias regions below 2^39");
-  if(!alias_space)alias_space=low_space+LOW_SIZE;
+  if(!alias_space)alias_space=low_space+low_size();
  }
 #endif
  heap=low_space+HEAP_OFF;
- fprintf(stderr,"[totk] guest layout: alias %#llx+%#llx stack %#llx+%#llx heap %#llx (cap %#llx)\n",(unsigned long long)ALIAS_START,ALIAS_SIZE,(unsigned long long)STACK_START,STACK_SIZE,(unsigned long long)(uintptr_t)heap,HEAP_CAP);
+ fprintf(stderr,"[totk] guest layout: alias %#llx+%#llx stack %#llx+%#llx heap %#llx (cap %#llx)\n",(unsigned long long)ALIAS_START,ALIAS_SIZE,(unsigned long long)STACK_START,STACK_SIZE,(unsigned long long)(uintptr_t)heap,heap_cap());
 }
+void runtime_memory_init(void){memory_init();}
+#ifdef TOTK_MOD_SUBSDK1
+uint8_t *runtime_arena_alloc(size_t size){
+ memory_init();
+ size=(size+0x3fff)&~(size_t)0x3fff;
+ if(arena_used+size>ARENA_SIZE)runtime_fail("module arena full");
+ uintptr_t at=(uintptr_t)low_space+ARENA_OFF+arena_used;
+ mach_vm_address_t a=at;
+ /* The slot lies inside the low reservation's PROT_NONE mapping, so it must be overwritten, not merely placed. */
+ kern_return_t kr=mach_vm_map(mach_task_self(),&a,size,0,VM_FLAGS_FIXED|VM_FLAGS_OVERWRITE,MEMORY_OBJECT_NULL,0,FALSE,VM_PROT_READ|VM_PROT_WRITE,VM_PROT_ALL,VM_INHERIT_DEFAULT);
+ if(kr!=KERN_SUCCESS||a!=at)runtime_fail("reserve module arena slot");
+ arena_used+=size;
+ return (uint8_t *)at;
+}
+uint8_t *runtime_module_arena_base(void){return low_space?(uint8_t *)((uintptr_t)low_space+ARENA_OFF):NULL;}
+uint8_t *runtime_module_arena_end(void){return low_space?(uint8_t *)((uintptr_t)low_space+ARENA_OFF+arena_used):NULL;}
+uint64_t runtime_guest_low_base(void){memory_init();return (uint64_t)(uintptr_t)low_space;}
+uint64_t runtime_guest_low_size(void){return low_size();}
+#endif
 /* Scoped stack moves: independent host backing, copy back on unmap.
  * Logical accounting is 4 KiB; Darwin protections are rounded to 16 KiB.
  * The leading/trailing partial source pages cannot be isolated on this host.
@@ -162,7 +216,11 @@ static uint64_t stack_move(int unmap,uint64_t dst,uint64_t src,uint64_t size){
  int inHeap=src>=(uintptr_t)heap&&size<=heap_size&&src-(uintptr_t)heap<=heap_size-size;
  uint64_t aliasStart=ALIAS_START;
  int inAlias=src>=aliasStart&&size<=ALIAS_SIZE&&src-aliasStart<=ALIAS_SIZE-size;
- if(!inHeap&&!inAlias)return 0xdc01;
+ /* A loaded module's memory is process-local like the heap. UltraCam's subsdk3 starts a worker thread
+    whose stack is a static buffer in its own data segment, and the console kernel moves those pages the
+    same way it moves a heap stack: copy them to the stack region and take the source away. */
+ int inModule=!inHeap&&!inAlias&&runtime_module_contains(src,size);
+ if(!inHeap&&!inAlias&&!inModule)return 0xdc01;
  pthread_mutex_lock(&memory_lock);
  if(inAlias){unsigned first=(unsigned)((src-aliasStart)/4096);for(uint64_t i=0;i<size/4096;i++)if(!alias_pages[first+i]){pthread_mutex_unlock(&memory_lock);return 0xdc01;}}
 
@@ -230,11 +288,21 @@ static void region_pages(uint64_t a,uint64_t end,uint64_t *resident,uint64_t *di
 }
 void runtime_guest_resident(uint64_t *resident,uint64_t *dirty,uint64_t *compressed){
  *resident=*dirty=*compressed=0;if(!low_space)return;
- region_pages((uintptr_t)low_space,(uintptr_t)low_space+LOW_SIZE,resident,dirty,compressed);
+ region_pages((uintptr_t)low_space,(uintptr_t)low_space+low_size(),resident,dirty,compressed);
  region_pages(ALIAS_START,ALIAS_START+ALIAS_SIZE,resident,dirty,compressed);
 }
 static void host_diag_init(void) { fprintf(stderr,"[totk] native diagnostics initialized\n"); }
 static void host_oe_init(void) { fprintf(stderr,"[totk] application environment: local macOS process\n"); }
+/* nn::oe::Initialize is a no-op here, so the SDK's oe singleton stays null; mods still read the
+   display version at init (exlaunch matches it against a per-version hook table). The version
+   string is the first field; exlaunch reserves exactly 0x10 bytes for it (its 0x4f18 caller
+   frame ends 0x10 bytes below the entry stack pointer), so writing more overwrites the caller's
+   saved frame and DT_INIT's return address. */
+static void host_display_version(void *out) {
+ memset(out,0,0x10);
+ size_t n=sizeof(TOTK_GAME_VERSION)-1;if(n>0xf)n=0xf;
+ memcpy(out,TOTK_GAME_VERSION,n);
+}
 #ifdef GAME_BOTW
 void runtime_aoc_announce(void); int runtime_aoc_count(void); int runtime_aoc_list(int *out,int offset,int count);   /* aoc_romfs.c */
 static void host_aoc_init(void) { runtime_aoc_announce(); }   /* aoc_romfs.c: the DLC volumes (botw.md) */
@@ -328,6 +396,26 @@ static uint32_t observed_region(uint64_t *out,uint64_t size){
  return r;
 }
 static uint32_t observed_pages(uint64_t addr,uint64_t size){uint32_t r=((uint32_t(*)(uint64_t,uint64_t))runtime_symbol("_ZN2nn2os19AllocateMemoryPagesEmm"))(addr,size);if(r||trace_alloc())fprintf(stderr,"[totk] AllocateMemoryPages address=%llx size=%llx result=%x\n",(unsigned long long)addr,(unsigned long long)size,r);return r;}
+/* UltraCam installs its trampolines by name (exl::hook::TrampolineHook::InstallAtSymbol), which goes through
+   nn::ro::LookupSymbol. That walks the ro service's registered module list; this port maps the NSOs itself, so
+   the loader's own symbol tables answer the same query. 0xa16 is the Result the SDK returns when no loaded
+   module exports the name. */
+static uint32_t host_lookup_symbol(uint64_t *out,const char *name){
+ /* A mod patches what it resolves, so the answer has to be a guest address it can map an alias of.
+    The port's host implementations reach those addresses instead (loader.c redirects the SDK body). */
+ void *found=runtime_symbol(name);
+ if(!found){fprintf(stderr,"[totk] ro::LookupSymbol %s: no module exports it\n",name);return 0xa16;}
+ if(out)*out=(uint64_t)(uintptr_t)found;
+ fprintf(stderr,"[totk] ro::LookupSymbol %s -> %#llx\n",name,(unsigned long long)(uintptr_t)found);
+ return 0;
+}
+/* UltraCam's subsdk3 brings up the network itself during startup (nn::nifm, then a nn::socket client of
+   127.0.0.1:3080). This port runs no nifm service, and the mod's own state machine has a branch for
+   "no network available", so answering offline is what a Switch without a saved network would do. The
+   two results are module 43 (nifm) errors; subsdk3 discards them and only reads IsNetworkAvailable. */
+static uint32_t host_nifm_initialize(void){fprintf(stderr,"[totk] nn::nifm::Initialize: this port has no network service\n");return 0x80002b01u;}
+static uint32_t host_nifm_submit_network_request(void){return 0x80002b01u;}
+static int host_nifm_is_available(void){return 0;}
 void *runtime_observer(const char *name) {
  static const struct {const char *name;void *fn;} entries[]={
  {"_ZN2nn2os21AllocateAddressRegionEPmm",observed_region},{"_ZN2nn2os19AllocateMemoryPagesEmm",observed_pages},{"nnosInitialize",observed_os_init},{"nninitInitializeSdkModule",observed_sdk_init},{"nninitStartup",observed_startup},{"nnMain",observed_main}};
@@ -341,13 +429,224 @@ void *runtime_override(const char *name) {
   {"_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE",focus_mode},{"_ZN2nn2oe20GetCurrentFocusStateEv",focus_state},
   {"_ZN2nn2oe28SetResumeNotificationEnabledEb",resume_enabled},{"_ZN2nn2oe42SetOperationModeChangedNotificationEnabledEb",operation_enabled},{"_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb",performance_enabled},
   {"nndiagStartup",host_diag_init},{"_ZN2nn2oe10InitializeEv",host_oe_init},{"_ZN2nn3aoc10InitializeEv",host_aoc_init},
+  {"_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE",host_display_version},
   {"_ZN2nn3aoc17CountAddOnContentEv",host_aoc_count},{"_ZN2nn3aoc16ListAddOnContentEPiii",host_aoc_list},
   {"_ZN2nn3err26InitializeContextWriterApiEv",host_error_init},{"_ZN2nn2fs24InitializeForApplicationEv",host_fs_init},
-  {"_ZN2nn4pctl10InitializeEv",host_pctl_init},{"_ZN2nn4diag34InitializeApplicationAbortObserverEv",host_abort_init}};
+  {"_ZN2nn4pctl10InitializeEv",host_pctl_init},{"_ZN2nn4diag34InitializeApplicationAbortObserverEv",host_abort_init},
+  {"_ZN2nn2ro12LookupSymbolEPmPKc",host_lookup_symbol},
+  {"_ZN2nn4nifm10InitializeEv",host_nifm_initialize},
+  {"_ZN2nn4nifm20SubmitNetworkRequestEv",host_nifm_submit_network_request},
+  {"_ZN2nn4nifm18IsNetworkAvailableEv",host_nifm_is_available}};
  for(size_t i=0;i<sizeof(entries)/sizeof(entries[0]);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;
  void *input=runtime_input_override(name);if(input)return input;void *font=runtime_font_override(name);if(font)return font;void *codec=runtime_codec_override(name);if(codec)return codec;void *movie=runtime_movie_override(name);if(movie)return movie;void *clock=runtime_time_override(name);if(clock)return clock;void *applet=runtime_applet_override(name);if(applet)return applet;void *swkbd=runtime_swkbd_override(name);if(swkbd)return swkbd;void *account=runtime_account_override(name);if(account)return account;void *fs=runtime_fs_override(name);if(fs)return fs;void *front=runtime_front_override(name);return front?front:runtime_gfx_override(name);
 }
+/* QueryMemory as the retail kernel describes the official layout. The game's own allocators
+   (thread stacks, heap) were validated against these semantics, so module builds keep them
+   byte-for-byte and only add the module arena the mod loader maps inside the low reservation. */
+static uint64_t default_query_memory(uint64_t *r) {
+ uint64_t addr=r[2],base=addr&~0xfffULL,size=0x1000;unsigned state=0,perm=0,attr=0;
+ uintptr_t top=(uintptr_t)pthread_get_stackaddr_np(pthread_self());size_t stack=pthread_get_stacksize_np(pthread_self());
+ if(addr>=top-stack&&addr<top){base=top-stack;size=stack;state=0xb;perm=3;}
+ else if(addr>=(uintptr_t)heap&&addr<(uintptr_t)heap+heap_size){base=(uintptr_t)heap;size=heap_size;state=5;perm=3;}
+#ifdef TOTK_MOD_SUBSDK1
+ else if(runtime_module_arena_base()&&addr>=(uintptr_t)runtime_module_arena_base()&&addr<(uintptr_t)runtime_module_arena_end()){
+  if(!runtime_arena_query(addr,&base,&size,&state,&perm,&attr))runtime_fail("module arena query");}
+#endif
+ else if(addr>=(uintptr_t)low_space&&addr<(uintptr_t)low_space+low_size()){base=(uintptr_t)low_space;size=low_size();if(addr<(uintptr_t)heap){size=(uintptr_t)heap-base;}else{base=(uintptr_t)heap+heap_size;size=(uintptr_t)low_space+low_size()-base;}}
+ else if(addr>=(uintptr_t)low_space+low_size()&&addr<ALIAS_START){base=(uintptr_t)low_space+low_size();size=ALIAS_START-base;state=0x10;perm=0;}   /* host-owned: Inaccessible */
+ else if(!addr){base=0;size=ASLR_START;state=0;perm=0;}
+ else if(runtime_module_query(addr,&base,&size,&state,&perm,&attr)){}
+ else {state=3;perm=5;}
+ pthread_mutex_lock(&memory_lock);
+ if(addr>=ALIAS_START&&addr<ALIAS_START+ALIAS_SIZE){
+  unsigned p=(unsigned)((addr-ALIAS_START)/4096),low=p,high=p+1;unsigned allocated=alias_pages[p];
+  while(low>0&&alias_pages[low-1]==allocated)low--;while(high<sizeof(alias_pages)&&alias_pages[high]==allocated)high++;
+  base=ALIAS_START+(uint64_t)low*4096;size=(uint64_t)(high-low)*4096;state=allocated?5:0;perm=allocated?3:0;
+ }
+ for(unsigned i=0;i<nstack_maps;i++){
+  StackMap *m=&stack_maps[i];uint64_t end=m->dst+m->size,send=m->src+m->size;
+  if(addr>=m->dst&&addr<end){base=m->dst;size=m->size;state=0xb;perm=3;break;}
+  if(addr>=m->src&&addr<send){base=m->src;size=m->size;state=5;perm=0;attr=4;break;}
+  if(state==0){uint64_t oldEnd=base+size;if(end<=addr&&end>base)base=end;if(m->dst>addr&&m->dst<oldEnd)oldEnd=m->dst;size=oldEnd-base;}
+  else if(state==5){uint64_t oldEnd=base+size;if(send<=addr&&send>base)base=send;if(m->src>addr&&m->src<oldEnd)oldEnd=m->src;size=oldEnd-base;}
+ }pthread_mutex_unlock(&memory_lock);
+ struct {uint64_t base,size;uint32_t state,attr,perm,ipc,device,pad;} info={base,size,state,attr,perm,0,0,0};
+ if(r[0])memcpy((void *)(uintptr_t)r[0],&info,sizeof(info));r[0]=0;r[1]=0;return 0;
+}
 void runtime_core_checkpoint(void);
+#ifdef TOTK_MOD_SUBSDK1
+static int mod_negative(void){static int value=-1;if(value<0){const char *e=getenv("TOTK_PROBE_NEGATIVE");value=e?atoi(e):0;}return value;}
+/* MapProcessMemory windows (SVC 0x74/0x75): exlaunch's RwPages maps module pages at an alias address so it can write code.
+   The guest is this process, so a window is a second mapping of the same pages. Host pages are 16 KiB: a window whose
+   source and destination are congruent modulo 16 KiB is shared, so writes through the window reach the module at once;
+   any other window is a private copy written back before the unmap. */
+#define MAX_MAP_WINDOWS 512
+typedef struct {uint64_t dst,src,size,host,host_size;int shared;} MapWindow;
+static MapWindow map_windows[MAX_MAP_WINDOWS];static unsigned nmap_windows;
+static int mod_window_query(uint64_t addr,uint64_t *base,uint64_t *size,unsigned *state,unsigned *permission) {
+ for(unsigned i=0;i<nmap_windows;i++){const MapWindow *w=&map_windows[i];
+  if(addr>=w->host&&addr-w->host<w->host_size){*base=w->host;*size=w->host_size;*state=5;*permission=3;return 1;}}
+ return 0;
+}
+/* Full, monotonic memory map for exlaunch's module scan. Every address below 2^39
+   belongs to exactly one region and regions never overlap, so the scan advances by
+   region size; querying 2^39 wraps to region 0, whose base is below the previous
+   region and ends the scan (the real kernel masks the address the same way). */
+static uint64_t mod_query_memory(uint64_t *r,int exlaunch) {
+ if(!exlaunch)return default_query_memory(r);
+ uint64_t out=r[0],addr=r[2]&(GUEST_ADDRESS_LIMIT-1);
+ uint64_t base=addr&~0xfffULL,size=0x1000;unsigned state=0,attribute=0,permission=0;
+ uint64_t lo=(uintptr_t)low_space,hi=lo+low_size();
+ uint64_t as=ALIAS_START,ae=ALIAS_START+ALIAS_SIZE;
+ uintptr_t top=(uintptr_t)pthread_get_stackaddr_np(pthread_self());size_t stack=pthread_get_stacksize_np(pthread_self());
+ if(addr>=(uint64_t)(top-stack)&&addr<(uint64_t)top){base=top-stack;size=stack;state=0xb;permission=3;}
+ else if(heap_size&&addr>=(uintptr_t)heap&&addr<(uintptr_t)heap+heap_size){base=(uintptr_t)heap;size=heap_size;state=5;permission=3;}
+ else if(addr>=lo&&addr<hi) {
+  uint64_t stack0=(uintptr_t)low_space+STACK_OFF,stack1=stack0+STACK_SIZE;
+  uint64_t heap0=(uintptr_t)heap,heap1=heap0+heap_size;
+  uint64_t ar0=(uintptr_t)runtime_module_arena_base(),ar1=(uintptr_t)runtime_module_arena_end();
+  uint64_t ares1=lo+ARENA_OFF+ARENA_SIZE;
+  int hide=mod_negative()==30;   /* negative control: the arena reads back as free memory */
+  if(addr>=stack0&&addr<stack1){base=stack0;size=STACK_SIZE;state=0xb;permission=3;}
+  else if(heap_size&&addr>=heap0&&addr<heap1){base=heap0;size=heap_size;state=5;permission=3;}
+  else if(ar0&&addr>=ar0&&addr<ar1){if(hide){base=ar0;size=ares1-ar0;state=0;permission=0;}else if(!runtime_arena_query(addr,&base,&size,&state,&permission,&attribute))runtime_fail("module arena query");}
+  else if(ar0&&addr>=ar1&&addr<ares1){base=ar1;size=ares1-ar1;state=0x10;permission=0;}
+  else {
+   /* Free runs: before the stack, between stack and heap start, after the heap
+      reservation. MapProcessMemory windows occupy free runs, so they show up as
+      mapped and split the runs the module scan steps through. */
+   uint64_t limit=ar0?ar0:hi,low,high;
+   pthread_mutex_lock(&memory_lock);
+   if(mod_window_query(addr,&base,&size,&state,&permission)) {}
+   else if(exlaunch&&addr>=heap1&&addr<heap0+heap_cap()){base=heap1;size=heap0+heap_cap()-heap1;state=0x10;permission=0;}
+   else {
+    if(addr<stack0){low=lo;high=stack0;}
+    else if(addr>=stack1&&addr<heap0){low=stack1;high=heap0;}
+    else {low=exlaunch?heap0+heap_cap():heap1;high=limit;
+     if(addr<low||addr>=high){pthread_mutex_unlock(&memory_lock);runtime_fail("low-space region gap");}}
+    for(unsigned i=0;i<nmap_windows;i++){const MapWindow *w=&map_windows[i];
+     if(w->host+w->host_size<=addr&&w->host+w->host_size>low)low=w->host+w->host_size;
+     if(w->host>addr&&w->host<high)high=w->host;}
+    if(low>addr||high<=addr){pthread_mutex_unlock(&memory_lock);runtime_fail("module window split");}
+    /* exlaunch allocates 4 KiB units from the ASLR pool; one host 16 KiB page cannot
+       hold two unrelated windows, so unaligned candidates read as reserved and its
+       retry loop picks another address. */
+    if(exlaunch&&(addr&0x3fff)){base=addr&~0xfffULL;size=0x1000;state=0x10;permission=0;}
+    else {base=low;size=high-low;state=0;permission=0;}
+   }
+   pthread_mutex_unlock(&memory_lock);
+  }
+ }
+ else if(addr>=as&&addr<ae) {
+  unsigned limit=(unsigned)(ALIAS_SIZE/4096),p=(unsigned)((addr-as)/4096),l=p,h=p+1;
+  pthread_mutex_lock(&memory_lock);unsigned allocated=alias_pages[p];
+  while(l>0&&alias_pages[l-1]==allocated)l--;while(h<limit&&alias_pages[h]==allocated)h++;
+  pthread_mutex_unlock(&memory_lock);
+  base=as+(uint64_t)l*4096;size=(uint64_t)(h-l)*4096;state=allocated?5:0;permission=allocated?3:0;
+ }
+ else if(addr>=hi&&addr<as){base=hi;size=as-hi;state=0x10;permission=0;}   /* host-owned: Inaccessible */
+ else if(addr>=hi&&addr<GUEST_ADDRESS_LIMIT){base=hi>ae?hi:ae;size=GUEST_ADDRESS_LIMIT-base;state=0x10;permission=0;}
+ else if(!addr){base=0;size=lo;state=0;permission=0;}
+ else if(!runtime_module_query(addr,&base,&size,&state,&permission,&attribute)){base=addr&~0xfffULL;size=0x1000;state=3;permission=5;}
+ /* TOTK_QM_TRACE=1: every answer the exlaunch view gives, in query order (an exlaunch MemQuery that
+    stops early shows exactly which region shape it could not accept). */
+ {static int qm=-1;if(qm<0)qm=getenv("TOTK_QM_TRACE")!=NULL;
+  if(qm)fprintf(stderr,"[totk-qm] %#llx -> base=%#llx size=%#llx state=%x perm=%x\n",(unsigned long long)addr,
+   (unsigned long long)base,(unsigned long long)size,state,permission);}
+ struct {uint64_t base,size;uint32_t state,attr,perm,ipc,device,pad;} info={base,size,state,attribute,permission,0,0,0};
+ if(out)memcpy((void *)(uintptr_t)out,&info,sizeof(info));
+ r[0]=0;r[1]=0;return 0;
+}
+static int mod_source_range(uint64_t src,uint64_t size) {
+ if(runtime_module_contains(src,size))return 1;
+ return heap_size&&src>=(uintptr_t)heap&&src-(uintptr_t)heap<=heap_size&&size<=heap_size-(src-(uintptr_t)heap);
+}
+static uint64_t map_process_memory(uint64_t dst,uint64_t handle,uint64_t src,uint64_t size) {
+ if((uint32_t)handle!=0xffff8001u)return 0xdc01;   /* GetInfo 0xFDE9: the current process */
+ if(!size||((dst|src|size)&0xfff)||!mod_source_range(src,size))return 0xcc01;
+ uint64_t lo=(uintptr_t)low_space,dd=dst&~0x3fffULL,sd=src&~0x3fffULL;
+ uint64_t span_shared=(((src&0x3fff)+size+0x3fff)&~0x3fffULL);
+ int shared=!((dst^src)&0x3fff)&&mod_source_range(sd,span_shared);
+ uint64_t span=shared?span_shared:(((dst&0x3fff)+size+0x3fff)&~0x3fffULL);
+ if(dst<lo||dst-lo>low_size()-size||dd<lo||dd-lo>low_size()-span)return 0xdc01;
+ pthread_mutex_lock(&memory_lock);
+ for(unsigned i=0;i<nmap_windows;i++)if(overlaps(dd,span,map_windows[i].host,map_windows[i].host_size)){pthread_mutex_unlock(&memory_lock);return 0xdc01;}
+ if(nmap_windows==MAX_MAP_WINDOWS){pthread_mutex_unlock(&memory_lock);return 0xd401;}
+ int ok;
+ if(shared) {
+  mach_vm_address_t at=dd;vm_prot_t cur=0,max=0;
+  kern_return_t kr=mach_vm_remap(mach_task_self(),&at,span,0,VM_FLAGS_FIXED|VM_FLAGS_OVERWRITE,mach_task_self(),(mach_vm_address_t)sd,FALSE,&cur,&max,VM_INHERIT_DEFAULT);
+  ok=kr==KERN_SUCCESS&&at==dd&&mach_vm_protect(mach_task_self(),dd,span,FALSE,VM_PROT_READ|VM_PROT_WRITE)==KERN_SUCCESS;
+ } else {
+  mach_vm_address_t at=dd;
+  kern_return_t kr=mach_vm_map(mach_task_self(),&at,span,0,VM_FLAGS_FIXED|VM_FLAGS_OVERWRITE,MEMORY_OBJECT_NULL,0,FALSE,VM_PROT_READ|VM_PROT_WRITE,VM_PROT_ALL,VM_INHERIT_DEFAULT);
+  ok=kr==KERN_SUCCESS&&at==dd;
+  if(ok)memcpy((void *)(uintptr_t)dst,(const void *)(uintptr_t)src,size);
+ }
+ if(ok)map_windows[nmap_windows++]=(MapWindow){dst,src,size,dd,span,shared};
+ pthread_mutex_unlock(&memory_lock);
+ if(!ok){fprintf(stderr,"[totk] MapProcessMemory %#llx <- %#llx size=%#llx failed\n",(unsigned long long)dst,(unsigned long long)src,(unsigned long long)size);return 0xdc01;}
+ fprintf(stderr,"[totk] %s window %#llx <- %#llx size=%#llx\n",shared?"shared":"copied",(unsigned long long)dst,(unsigned long long)src,(unsigned long long)size);
+ return 0;
+}
+/* A copied window's source is module code or rodata, which the host keeps read-only: Apple Silicon
+   refuses any mapping that is both writable and executable. Write the alias bytes back through a
+   second mapping of the same host page that is read-write instead of taking EXECUTE away from the
+   guest's page: both entries share the frame, so the copy is visible while the source stays r-x and
+   a thread running module code never takes a transient instruction abort. Both callers hold
+   memory_lock, so one alias page serves every publish. */
+static uint8_t *write_alias;
+static int window_write_back(uint64_t dst,uint64_t src,uint64_t size) {
+ if(!write_alias) {
+  mach_vm_address_t at=0;
+  if(mach_vm_map(mach_task_self(),&at,0x4000,0,VM_FLAGS_ANYWHERE,MEMORY_OBJECT_NULL,0,FALSE,
+   VM_PROT_READ|VM_PROT_WRITE,VM_PROT_READ|VM_PROT_WRITE,VM_INHERIT_NONE)!=KERN_SUCCESS)return 0;
+  write_alias=(uint8_t *)(uintptr_t)at;
+ }
+ uint64_t first=src&~0x3fffULL,last=(src+size-1)&~0x3fffULL;
+ for(uint64_t page=first;;page+=0x4000) {
+  mach_vm_address_t at=page;mach_vm_size_t len=0;vm_region_basic_info_data_64_t info;
+  mach_msg_type_number_t count=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t obj=0;
+  kern_return_t kr=mach_vm_region(mach_task_self(),&at,&len,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&info,&count,&obj);
+  if(obj)mach_port_deallocate(mach_task_self(),obj);
+  if(kr!=KERN_SUCCESS||page<at||page>=at+len)return 0;
+  mach_vm_address_t alias=(mach_vm_address_t)write_alias;vm_prot_t cur=0,max=0;
+  kr=mach_vm_remap(mach_task_self(),&alias,0x4000,0,VM_FLAGS_FIXED|VM_FLAGS_OVERWRITE,mach_task_self(),page,FALSE,&cur,&max,VM_INHERIT_NONE);
+  if(kr!=KERN_SUCCESS||alias!=(mach_vm_address_t)write_alias)return 0;
+  if(mach_vm_protect(mach_task_self(),alias,0x4000,FALSE,VM_PROT_READ|VM_PROT_WRITE)!=KERN_SUCCESS)return 0;
+  uint64_t start=page>src?page:src,end=page+0x4000<src+size?page+0x4000:src+size;
+  memcpy(write_alias+(start-page),(const void *)(uintptr_t)(dst+(start-src)),(size_t)(end-start));
+  if(page>=last)break;
+ }
+ sys_icache_invalidate((void *)(uintptr_t)src,size);
+ return 1;
+}
+/* Persistent RwPages windows are never unmapped, so a copied window must publish its alias writes
+   to the source while the guest is still running. Exlaunch's RwPages::Sync (0x4db0) starts by
+   reading CTR_EL0 (0x5c98/0x5cd4), which Darwin traps and the runtime emulates; that is the
+   publication point. Shared windows already see each other and need nothing. */
+void mod_window_publish(void) {
+ pthread_mutex_lock(&memory_lock);
+ for(unsigned i=0;i<nmap_windows;i++){const MapWindow *w=&map_windows[i];
+  if(!w->shared&&!window_write_back(w->dst,w->src,w->size))runtime_fail("window publish write-back");}
+ pthread_mutex_unlock(&memory_lock);
+}
+static uint64_t unmap_process_memory(uint64_t dst,uint64_t handle,uint64_t src,uint64_t size) {
+ if((uint32_t)handle!=0xffff8001u)return 0xdc01;
+ if(!size||((dst|src|size)&0xfff))return 0xcc01;
+ pthread_mutex_lock(&memory_lock);
+ unsigned i;for(i=0;i<nmap_windows;i++)if(map_windows[i].dst==dst&&map_windows[i].src==src&&map_windows[i].size==size)break;
+ if(i==nmap_windows){pthread_mutex_unlock(&memory_lock);return 0xd401;}
+ MapWindow w=map_windows[i];map_windows[i]=map_windows[--nmap_windows];
+ if(w.shared)sys_icache_invalidate((void *)(uintptr_t)src,size);
+ else if(!window_write_back(dst,src,size))runtime_fail("copied window write-back");
+ void *p=mmap((void *)(uintptr_t)w.host,(size_t)w.host_size,PROT_NONE,MAP_FIXED|MAP_PRIVATE|MAP_ANON,-1,0);
+ pthread_mutex_unlock(&memory_lock);
+ if(p!=(void *)(uintptr_t)w.host)runtime_fail("decommit module window");
+ fprintf(stderr,"[totk] %s window %#llx <- %#llx size=%#llx\n",w.shared?"unmapped":"copied back",(unsigned long long)dst,(unsigned long long)src,(unsigned long long)size);
+ return 0;
+}
+#endif
 #ifdef GAME_BOTW
 /* Breath of the Wild (botw.md): the preemption point is also after every SVC. A thread the SVC woke competes for a core at
    once (threads.c wake_queue); when it beats this one on this core, Horizon runs it before the SVC returns. */
@@ -369,20 +668,24 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  case 0x02:r[0]=runtime_module_permission(r[0],r[1],(unsigned)r[2]);return r[0];
  case 0x03:r[0]=runtime_module_lock_permission(r[0],r[1],(unsigned)r[2],(unsigned)r[3]);return r[0];
  case 0x29: {
-  uint64_t value=0;unsigned id=(unsigned)r[1];
+  uint64_t value=0;unsigned id=(unsigned)r[1];int exlaunch_module=!strcmp(module,"subsdk1")||!strcmp(module,"subsdk3");
   switch(id) {
   case 0:value=7;break;case 1:value=0x0ffffffff0000000ULL;break;
   case 2:value=ALIAS_START;break;case 3:value=ALIAS_SIZE;break;
-  case 4:value=(uintptr_t)heap;break;case 5:value=HEAP_CAP;break;
+  case 4:value=(uintptr_t)heap;break;case 5:value=heap_cap();break;
   case 6:case 21:value=APP_POOL;break;case 7:case 22:value=runtime_image_bytes()+heap_size+alias_bytes;
    { static unsigned polls; if(getenv("TOTK_MEM_LOG")&&(polls++%600)==0) fprintf(stderr,"[totk-mem] GetInfo(%u) total=%#llx used=%#llx image=%#llx heap=%#llx alias=%#llx\n",id,(unsigned long long)APP_POOL,(unsigned long long)value,(unsigned long long)runtime_image_bytes(),(unsigned long long)heap_size,(unsigned long long)alias_bytes); }
    break;
   case 8:value=0;break;case 10:value=0;break;
   case 11:arc4random_buf(&value,8);break;
-  case 12:value=ASLR_START;break;case 13:value=ASLR_SIZE;break;
+  /* exlaunch allocates its RwPages alias addresses from the ASLR region; keep its
+     choices inside the low reservation the module build actually maps. subsdk3 carries the
+     same exlaunch code, so it gets the same region. */
+  case 12:value=exlaunch_module?(uintptr_t)low_space:ASLR_START;break;case 13:value=exlaunch_module?low_size():ASLR_SIZE;break;
   case 14:value=STACK_START;break;case 15:value=STACK_SIZE;break;
   case 16:value=SYSTEM_RESOURCE_BUDGET;break;case 17:value=sizeof(stack_maps)+sizeof(alias_pages);break;case 18:value=GAME_PROGRAM_ID;break;
   case 20:value=(uintptr_t)user_exception_context;break;   /* UserExceptionContextAddress: SDK stores e.g. the dying-message region at +0x1c0 */case 23:value=1;break;
+  case 0xfde9:value=0xffff8001ULL;break;   /* pseudo-handle of the current process (MapProcessMemory) */
   /* AliasRegionExtraSize (18.0.0+): our alias reservation contains no
    * kernel-owned extension outside the range reported by ids 2 and 3. */
   case 28:value=0;break;
@@ -394,41 +697,42 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
   if(getenv("TOTK_MEM_LOG"))fprintf(stderr,"[totk-mem] %sMapPhysicalMemory %#llx+%#llx -> %#llx alias=%#llx remaining=%#llx\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)alias_bytes,(unsigned long long)(APP_POOL-runtime_image_bytes()-heap_size-alias_bytes));
   if(r[0])fprintf(stderr,"[totk] %sMapPhysicalMemory %#llx+%#llx failed %#llx (alias %#llx used, heap %#llx)\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)alias_bytes,(unsigned long long)heap_size);return r[0];}
  case 0x04:case 0x05:r[0]=stack_move(num==5,r[0],r[1],r[2]);return r[0];
- case 0x06: {
-  uint64_t addr=r[2],base=addr&~0xfffULL,size=0x1000;unsigned state=0,perm=0,attr=0;
-  uintptr_t top=(uintptr_t)pthread_get_stackaddr_np(pthread_self());size_t stack=pthread_get_stacksize_np(pthread_self());
-  if(addr>=top-stack&&addr<top){base=top-stack;size=stack;state=0xb;perm=3;}
-  else if(addr>=(uintptr_t)heap&&addr<(uintptr_t)heap+heap_size){base=(uintptr_t)heap;size=heap_size;state=5;perm=3;}
-  else if(addr>=(uintptr_t)low_space&&addr<(uintptr_t)low_space+LOW_SIZE){base=(uintptr_t)low_space;size=LOW_SIZE;if(addr<(uintptr_t)heap){size=(uintptr_t)heap-base;}else{base=(uintptr_t)heap+heap_size;size=(uintptr_t)low_space+LOW_SIZE-base;}}
-  else if(addr>=(uintptr_t)low_space+LOW_SIZE&&addr<ALIAS_START){base=(uintptr_t)low_space+LOW_SIZE;size=ALIAS_START-base;state=0x10;perm=0;}   /* host-owned: Inaccessible */
-  else if(!addr){base=0;size=ASLR_START;state=0;perm=0;}
-  else if(runtime_module_query(addr,&base,&size,&state,&perm,&attr)){}
-  else {state=3;perm=5;}
-  pthread_mutex_lock(&memory_lock);
-  if(addr>=ALIAS_START&&addr<ALIAS_START+ALIAS_SIZE){
-   unsigned p=(unsigned)((addr-ALIAS_START)/4096),low=p,high=p+1;unsigned allocated=alias_pages[p];
-   while(low>0&&alias_pages[low-1]==allocated)low--;while(high<sizeof(alias_pages)&&alias_pages[high]==allocated)high++;
-   base=ALIAS_START+(uint64_t)low*4096;size=(uint64_t)(high-low)*4096;state=allocated?5:0;perm=allocated?3:0;
-  }
-  for(unsigned i=0;i<nstack_maps;i++){
-   StackMap *m=&stack_maps[i];uint64_t end=m->dst+m->size,send=m->src+m->size;
-   if(addr>=m->dst&&addr<end){base=m->dst;size=m->size;state=0xb;perm=3;break;}
-   if(addr>=m->src&&addr<send){base=m->src;size=m->size;state=5;perm=0;attr=4;break;}
-   if(state==0){uint64_t oldEnd=base+size;if(end<=addr&&end>base)base=end;if(m->dst>addr&&m->dst<oldEnd)oldEnd=m->dst;size=oldEnd-base;}
-   else if(state==5){uint64_t oldEnd=base+size;if(send<=addr&&send>base)base=send;if(m->src>addr&&m->src<oldEnd)oldEnd=m->src;size=oldEnd-base;}
-  }pthread_mutex_unlock(&memory_lock);
-  struct {uint64_t base,size;uint32_t state,attr,perm,ipc,device,pad;} info={base,size,state,attr,perm,0,0,0};
-  if(r[0])memcpy((void *)(uintptr_t)r[0],&info,sizeof(info));r[0]=0;r[1]=0;return 0;
- }
+ case 0x06:
+#ifdef TOTK_MOD_SUBSDK1
+  /* The exlaunch-loaded modules (subsdk1, and UltraCam's subsdk3) scan the address space themselves, so
+     they need the complete monotonic map; the game keeps the retail view it was validated against. */
+#ifdef TOTK_MOD_SUBSDK3
+  return mod_query_memory(r,!strcmp(module,"subsdk1")||!strcmp(module,"subsdk3"));
+#else
+  return mod_query_memory(r,!strcmp(module,"subsdk1"));
+#endif
+#else
+  return default_query_memory(r);
+#endif
+#ifdef TOTK_MOD_SUBSDK1
+ case 0x74:r[0]=map_process_memory(r[0],r[1],r[2],r[3]);
+  /* A mod that resolves a function by name and then patches it can be handed a host implementation instead of
+     guest code (the NVN entry points are the port's own). Those windows are refused above without a word, so
+     name the caller: this is the only way to see a hook that silently never installed. */
+  if(r[0])fprintf(stderr,"[totk] MapProcessMemory from %s+0x%llx: src %#llx size %#llx rejected %#llx\n",
+   module,(unsigned long long)offset,(unsigned long long)r[2],(unsigned long long)r[3],(unsigned long long)r[0]);
+  return r[0];
+ case 0x75:r[0]=unmap_process_memory(r[0],r[1],r[2],r[3]);return r[0];
+#endif
  case 0x01:{size_t size=r[1];if(getenv("TOTK_MEM_LOG"))fprintf(stderr,"[totk-mem] SetHeapSize %#zx (image=%#llx alias=%#llx pool=%#llx)\n",size,(unsigned long long)runtime_image_bytes(),(unsigned long long)alias_bytes,(unsigned long long)APP_POOL);
-  if(size>HEAP_CAP||size%0x200000||size+runtime_image_bytes()>APP_POOL){r[0]=0xd401;return r[0];}
+  if(size>heap_cap()||size%0x200000||size+runtime_image_bytes()>APP_POOL){fprintf(stderr,"[totk] SetHeapSize %#zx refused: heap limit %#llx (pool %#llx, images %#llx), requests must be 2 MiB aligned and fit the pool\n",size,(unsigned long long)heap_cap(),(unsigned long long)APP_POOL,(unsigned long long)runtime_image_bytes());r[0]=0xd401;return r[0];}
   if(size>heap_size&&mprotect(heap+heap_size,size-heap_size,PROT_READ|PROT_WRITE))runtime_fail("commit heap");
   if(size<heap_size&&mprotect(heap+size,heap_size-size,PROT_NONE))runtime_fail("decommit heap");heap_size=size;r[0]=0;r[1]=(uintptr_t)heap;return 0;}
+ case 0x1e: r[0]=runtime_now_ns()*12/625;return r[0];   /* GetSystemTick: 19.2 MHz */
  case 0x0c: r[0]=0;r[1]=44;return 0;
  case 0x0e: r[0]=0;r[1]=0;r[2]=15;return 0;
  case 0x25: {uint64_t id;pthread_threadid_np(NULL,&id);r[0]=0;r[1]=id;return 0;}
  case 0x10:r[0]=0;return 0;
- case 0x26: {uint32_t result=0;if(r[1]&&r[2]>=4)memcpy(&result,(void *)(uintptr_t)r[1],4);fprintf(stderr,"[totk] guest Break reason=%llx result=%x\n",(unsigned long long)r[0],result);runtime_trace_guest(r[29],r[30]);if(r[0]&0x80000000ULL)return 0;runtime_fail("original SDK Break");}
+ case 0x26: {uint32_t result=0;if(r[1]&&r[2]>=4)memcpy(&result,(void *)(uintptr_t)r[1],4);fprintf(stderr,"[totk] guest Break reason=%llx result=%x\n",(unsigned long long)r[0],result);
+  if(!(r[0]&0x80000000ULL)){fprintf(stderr,"[totk] break regs:");for(int i=0;i<31;i++)fprintf(stderr," x%d=%llx",i,(unsigned long long)r[i]);uint64_t sp=(uint64_t)((uint64_t *)r)[100];fprintf(stderr," sp=%llx\n",(unsigned long long)sp);
+   const uint64_t *st=(const uint64_t *)(uintptr_t)sp;for(int i=0;i<32;i++)fprintf(stderr,"[totk] sp+%03x=%llx\n",i*8,(unsigned long long)st[i]);
+   if(getenv("TOTK_DUMP_BREAK"))runtime_dump_break_state(r[29],r[30]);}
+  runtime_trace_guest(r[29],r[30]);if(r[0]&0x80000000ULL)return 0;runtime_fail("original SDK Break");}
  case 0x27: {size_t n=r[1];if(n>65536)runtime_fail("debug string too long");fwrite((void *)(uintptr_t)r[0],1,n,stderr);r[0]=0;return 0;}
  case 0x0b:{int64_t ns=(int64_t)r[0];if(ns>0){struct timespec t={ns/1000000000,ns%1000000000};nanosleep(&t,NULL);}r[0]=0;return 0;}
  default:fprintf(stderr,"[totk] unimplemented SVC 0x%x at %s+%#llx\n",num,module,(unsigned long long)offset);if(num==0x1f)fprintf(stderr,"[totk] named port %.12s\n",(const char *)(uintptr_t)r[1]);runtime_trace_guest(r[29],r[30]);runtime_fail("system service not implemented");return 0;

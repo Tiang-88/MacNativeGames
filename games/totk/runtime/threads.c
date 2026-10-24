@@ -732,7 +732,11 @@ int svc_thread(int num, uint64_t *regs) {
 
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
-        if(!regs[1]||!regs[3]||(regs[3]&15)||(int)regs[4]<28||(int)regs[4]>59||(int)regs[5]<-3||(int)regs[5]>2){regs[0]=R_BAD_STATE;return 1;}
+        /* Priorities take the kernel's whole range, 0x00-0x40: a mod's worker thread may sit below the
+           game's own threads (UltraCam uses 0x14), and refusing it is not what the console's kernel does. */
+        if(!regs[1]||!regs[3]||(regs[3]&15)||(int)regs[4]<0||(int)regs[4]>0x40||(int)regs[5]<-3||(int)regs[5]>2){
+            fprintf(stderr,"[totk] CreateThread refused: entry=%#llx arg=%#llx stack=%#llx prio=%d core=%d\n",(unsigned long long)regs[1],(unsigned long long)regs[2],(unsigned long long)regs[3],(int)regs[4],(int)regs[5]);
+            regs[0]=R_BAD_STATE;return 1;}
         thr_t *t = calloc(1, sizeof *t);
         if(!t)die("thread allocation");
         t->cur_core = -1;
@@ -797,7 +801,7 @@ int svc_thread(int num, uint64_t *regs) {
         return 1;
     }
     case 0x0C: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)t->prio : 0; pthread_mutex_unlock(&G);return 1; }
-    case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
+    case 0x0D: { if(regs[1]<0||regs[1]>0x40){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
     case 0x0E: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[2], O_THREAD);
                  regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0;pthread_mutex_unlock(&G); return 1; }
     case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)：-1 = 用进程缺省、-2/-3 = 不改理想核；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask): -1 = use the process default, -2/-3 = leave the ideal core unchanged; the host only keeps the bookkeeping

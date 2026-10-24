@@ -94,6 +94,9 @@ int runtime_aspect_toggle(void) {
     return 1;
 }
 
+/* The ratio of key 4's wide step (21:9 unless TOTK_ASPECT named another). */
+float runtime_aspect_wide_ratio(void) { return g_aspect_wide; }
+
 /* sites: instructions that leave the ratio in an s register (fdiv s<d>, ... or ldr s<d>, [x<n>, #imm]), each with a
    plain stub from stub_off (ASPECT_STUB bytes per site). The first ncam are camera sites: when vert_off is not 0 and
    the inlined setFovy is there, their fovy load also gets a Vert+ stub (ASPECT_VSTUB bytes each, from vert_off). Both

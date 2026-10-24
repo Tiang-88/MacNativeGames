@@ -13,8 +13,17 @@ sys.path.insert(0, str(ROOT / 'third_party/d2r'))
 from relr import decode_relr
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--version', choices=('v0','v112','v121','v143','botw160','botw190'), default='v0')
-version = parser.parse_args().version
+parser.add_argument('--mod', action='store_true',
+                    help='module build: synthetic rtld, then main, subsdk0, the player subsdk1, sdk')
+parser.add_argument('--uc', action='store_true',
+                    help='UltraCam build: with --mod, the player subsdk3 goes between subsdk1 and sdk')
+args = parser.parse_args()
+if args.uc and not args.mod:
+    parser.error('--uc requires --mod')
+version = args.version
 OUT = ROOT / ('build' if version == 'v0' else f'build/{version}')
+if args.mod:
+    OUT = OUT.with_name(OUT.name + ('-uc' if args.uc else '-mod'))
 OUT.mkdir(parents=True, exist_ok=True)
 report = json.loads((ROOT / ('analysis/phase12-validation.json' if version == 'v0' else f'analysis/{version}-port/phase12-validation.json')).read_text())
 assert report['status'] == 'pass' and report['rom_version'] == version
@@ -29,17 +38,23 @@ if version == 'botw190':   # Breath of the Wild 1.9.0 (docs/botw-v1.9.0-port.md)
     assert report['module_file_sha256']['extracted/botw190/exefs/main'] == 'f6f0b20bb1f2b67d164c24871cd473147eef1d285f12e7bd492e3126c6022e27', 'Unsupported BotW 1.9.0 main image'
 if version == 'v143':
     assert report['module_file_sha256']['extracted/v143/exefs/main'] == 'e84a90d551fed0824b4b74933b9c6d043c458521363a7cea58b2faca1822dc9e', 'Unsupported 1.4.3 main image'
-modules = []
-for name in ['main', 'subsdk0', 'sdk']:
-    path = ROOT / f'rewritten/{version}/{name}.patched.bin'
-    image = path.read_bytes()
-    digest = hashlib.sha256(image).hexdigest()
-    assert digest == report['module_file_sha256'][str(path.relative_to(ROOT))], 'Unverified rewrite'
-    inv = json.loads((ROOT / f'extracted/{version}/elf/{name}-inventory.json').read_text())
+
+
+def read_layout(name):
     layout = {}
     for line in (ROOT / f'rewritten/{version}/{name}.fixups.tsv').read_text().splitlines():
         _, key, value = line.split()
         layout[key] = int(value, 0)
+    return layout
+
+
+def load_image(name, official):
+    path = ROOT / f'rewritten/{version}/{name}.patched.bin'
+    image = path.read_bytes()
+    digest = hashlib.sha256(image).hexdigest()
+    if official:
+        assert digest == report['module_file_sha256'][str(path.relative_to(ROOT))], 'Unverified rewrite'
+    layout = read_layout(name)
     mod0 = struct.unpack_from('<I', image, 4)[0]
     assert image[mod0:mod0 + 4] == b'MOD0'
     dyn = mod0 + struct.unpack_from('<i', image, mod0 + 4)[0]
@@ -85,19 +100,52 @@ for name in ['main', 'subsdk0', 'sdk']:
         ret, kind, arg, original = line.split()
         assert kind in ['cntpct', 'cntvct', 'svc']
         gates.append(dict(ret=int(ret, 0), timer=kind != 'svc', arg=int(arg), original=int(original, 0)))
-    # Match each compiler's actual DT_INIT state load before decoding it.
-    flag_reg, load_offset = (19, 20) if version in ('v143', 'botw160', 'botw190') else (20, 24)
-    a, w = struct.unpack_from('<I', image, tags[12]+16)[0], struct.unpack_from('<I', image, tags[12]+load_offset)[0]
-    assert a & 0x9f00001f == 0x90000000 | flag_reg and w & 0xffc003ff == 0xb9400008 | (flag_reg << 5)
-    imm = ((a >> 29) & 3) | (((a >> 5) & 0x7ffff) << 2)
-    imm = (imm ^ (1 << 20)) - (1 << 20)
-    ctor_flag = ((tags[12]+16) & ~4095) + (imm << 12) + ((w >> 10) & 0xfff)*4
-    assert layout['DATA_OFF'] <= ctor_flag < layout['KEY_PAGE_OFF']
-    modules.append(dict(name=name, sha256=digest, size=len(image), ctor_flag=ctor_flag, layout=layout, tags=tags,
-                        symbols=symbols, relocs=relocs, gates=gates))
+    module = dict(name=name, sha256=digest, size=len(image), ctor_flag=0, layout=layout, tags=tags,
+                  symbols=symbols, relocs=relocs, gates=gates)
+    if official:
+        # Match each compiler's actual DT_INIT state load before decoding it.
+        flag_reg, load_offset = (19, 20) if version in ('v143', 'botw160', 'botw190') else (20, 24)
+        a, w = struct.unpack_from('<I', image, tags[12]+16)[0], struct.unpack_from('<I', image, tags[12]+load_offset)[0]
+        assert a & 0x9f00001f == 0x90000000 | flag_reg and w & 0xffc003ff == 0xb9400008 | (flag_reg << 5)
+        imm = ((a >> 29) & 3) | (((a >> 5) & 0x7ffff) << 2)
+        imm = (imm ^ (1 << 20)) - (1 << 20)
+        ctor_flag = ((tags[12]+16) & ~4095) + (imm << 12) + ((w >> 10) & 0xfff)*4
+        assert layout['DATA_OFF'] <= ctor_flag < layout['KEY_PAGE_OFF']
+        module['ctor_flag'] = ctor_flag
+    return module
+
+
+def synthetic_rtld():
+    # The scan exlaunch runs at startup numbers modules by memory order. The native
+    # port has no rtld image, but main must stay record 1, so a minimal module
+    # (text, rodata, data; no code, no relocations) occupies record 0.
+    name = 'rtld'
+    path = ROOT / f'rewritten/{version}/{name}.patched.bin'
+    image = path.read_bytes()
+    layout = read_layout(name)
+    assert len(image) == layout['PATCH_OFF'] + 0x4000 and layout['KEY_PAGE_OFF'] == 0x10000
+    return dict(name=name, sha256=hashlib.sha256(image).hexdigest(), size=len(image), ctor_flag=0,
+                layout=layout, tags={}, symbols=[
+                    dict(name='', value=0, size=0, defined=0, binding=0, type=0),
+                    # subsdk1 imports this global function pointer from the console's rtld. The native
+                    # port has no rtld image, so the placeholder exports it as a zero-initialized data
+                    # object (rtld data starts at offset 0x8000).
+                    dict(name='_ZN2nn2ro6detail35g_LookupGlobalManualFunctionPointerE',
+                         value=0x8000, size=8, defined=1, binding=1, type=1)],
+                relocs=[], gates=[])
+
+
+modules = [synthetic_rtld()] if args.mod else []
+for name in (['main', 'subsdk0'] if args.mod else ['main', 'subsdk0', 'sdk']):
+    modules.append(load_image(name, True))
+if args.mod:
+    modules.append(load_image('subsdk1', False))
+    if args.uc:
+        modules.append(load_image('subsdk3', False))
+    modules.append(load_image('sdk', True))
 
 # Find main's ORIGINAL PLT stub addressing the relocated GetSystemTick slot.
-main = modules[0]
+main = next(m for m in modules if m['name'] == 'main')
 target = '_ZN2nn2os13GetSystemTickEv'
 slot = next(r['where'] for r in main['relocs'] if main['symbols'][r['symbol']]['name'] == target and r['kind'] == 1026)
 image = (ROOT / f'rewritten/{version}/main.patched.bin').read_bytes()
@@ -113,7 +161,7 @@ assert len(plt) == 1, f'PLT matches {plt}'
 main['probe_plt'] = plt[0]
 main['probe_slot'] = slot
 
-lines = ['/* Generated locally from validated player images; do not commit. */']
+lines = ['/* Generated locally from validated player images; mod builds add a synthetic rtld and the player subsdk modules; do not commit. */']
 for n, m in enumerate(modules):
     lines.append(f'static const Reloc reloc_{n}[] = {{')
     lines.extend(f'{{{r["where"]}ULL,{r["kind"]},{r["symbol"]},{r["addend"]}LL}},' for r in m['relocs'])
@@ -130,8 +178,14 @@ for n, m in enumerate(modules):
     l = m['layout']
     lines.append('{' + f'.name={json.dumps(m["name"])},.digest={json.dumps(m["sha256"])},.file_size={m["size"]}ULL,.text_end={l["TEXT_END"]}ULL,.ro_off={l["RO_OFF"]}ULL,.data_off={l["DATA_OFF"]}ULL,.patch_off={l["PATCH_OFF"]}ULL,.key_off={l["KEY_PAGE_OFF"]}ULL,.symbols=symbol_{n},.nsym={len(m["symbols"])},.relocs=reloc_{n},.nreloc={len(m["relocs"])},.gates=gate_{n},.ngate={len(m["gates"])},.init={m["tags"].get(12,0)}ULL,.ctor_flag={m["ctor_flag"]}ULL,.init_array={m["tags"].get(25,0)}ULL,.init_size={m["tags"].get(27,0)}ULL' + '},')
 lines.append('};')
+main_index = modules.index(main)
+lines.append(f'#define MAIN_MODULE_INDEX {main_index}')
 lines.append(f'#define PROBE_PLT {main["probe_plt"]}ULL\n#define PROBE_SLOT {slot}ULL')
 (OUT / 'runtime_tables.h').write_text('\n'.join(lines) + '\n')
 # Details are evidence, not additional source code.
-(ROOT / ('analysis/runtime-layout.json' if version == 'v0' else f'analysis/{version}-port/runtime-layout.json')).write_text(json.dumps(modules, indent=2) + '\n')
-print(json.dumps(dict(modules=len(modules), relocations=sum(len(m['relocs']) for m in modules), original_main_plt=hex(plt[0]), original_main_slot=hex(slot))))
+layout_path = ROOT / ('analysis/runtime-layout.json' if version == 'v0' else f'analysis/{version}-port/runtime-layout.json')
+if args.mod:
+    layout_path = layout_path.with_name(('uc-' if args.uc else 'mod-') + layout_path.name)
+layout_path.write_text(json.dumps(modules, indent=2) + '\n')
+print(json.dumps(dict(modules=[m['name'] for m in modules], relocations=sum(len(m['relocs']) for m in modules),
+                      main_index=main_index, original_main_plt=hex(plt[0]), original_main_slot=hex(slot))))

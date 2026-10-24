@@ -258,11 +258,15 @@ void botw_tiny_commit(void);
 #define BOTW_DEAD_KEEP(k)
 #define BOTW_TEX_RELEASE_KEEP(k)
 #define BOTW_DEAD_FORGET(s, n)
-#define BOTW_WB_ENT_FIELDS
-#define BOTW_WB_NOTED(e, k)
+#define BOTW_WB_ENT_FIELDS uint64_t fence;
+#define BOTW_WB_NOTED(e, k) (e)->fence = g_fence + 1;
 #define BOTW_WB_STAGE_FREE(e)
 #define BOTW_WB_STAGE()
-#define WB_WAIT_GPU(list, nl) mtl_finish_gpu();
+int totk_wb_fence_on(void);
+/* TOTK_WB_FENCE=0 waits for all submitted GPU work, as before. Otherwise a write-back waits only for the submissions that
+   rendered the listed textures (the game waits for its own sync before invalidating), then for uploads to finish. */
+#define WB_WAIT_GPU(list, nl) { uint64_t need_ = 0; for (int i_ = 0; i_ < (nl); i_++) if ((list)[i_]->fence > need_) need_ = (list)[i_]->fence; \
+    if (totk_wb_fence_on()) { if (need_) mtl_wait(need_, UINT64_MAX); while (atomic_load(&g_up_pending)) usleep(1000); } else mtl_finish_gpu(); }
 #define BOTW_WB_FROM_STAGE(e, ok, layers)
 #define BOTW_TINY_NOTE(t, o)
 #define BOTW_TINY_COMMIT()
@@ -302,7 +306,7 @@ typedef struct { int32_t first, n; vs_st st[16]; } p_bind_vstream;
 typedef struct { int32_t first, n; NVNbufferRange r[16]; } p_bind_vbuf;
 typedef struct { int32_t stage, index; uint64_t addr, size; } p_bind_buf;  // UBO / SSBO
 // src: NVN 55 *Deferred binds keep the game's handle array pointer (read at submit into h, see hle_nvn.c resolve_deferred); 0 = immediate
-typedef struct { int32_t stage, first, n, pad_; uint64_t src; uint64_t h[32]; } p_bind_handles; // 分离贴图 / 采样器句柄 | Separate texture / sampler handles
+typedef struct { int32_t stage, first, n, base_t, base_s; uint64_t src; uint64_t h[32]; } p_bind_handles; // 分离贴图 / 采样器句柄 | Separate texture / sampler handles
 typedef struct { int32_t face, value_mask, mask, ref, which; } p_stencil;  // which：0 值掩码 1 写掩码 2 参考值 | which: 0 value mask 1 write mask 2 reference value
 typedef struct { float factor, units, clamp; } p_poly_offset;
 typedef struct { int32_t prim, first, count, base_instance, instances; } p_draw;   // TOTK: instances 0 = one instance (DrawArrays)

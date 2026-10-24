@@ -51,6 +51,18 @@ uint8_t *runtime_module_base(const char *name);   /* runtime/loader.c: "main", "
 uint64_t runtime_module_permission(uint64_t address,uint64_t size,unsigned permission);
 uint64_t runtime_module_lock_permission(uint64_t address,uint64_t size,unsigned mask,unsigned attribute);
 int runtime_module_query(uint64_t address,uint64_t *base,uint64_t *size,unsigned *state,unsigned *permission,unsigned *attribute);
+int runtime_module_contains(uint64_t address,uint64_t size);
+/* Mod build (TOTK_MOD_SUBSDK1): modules are mapped one after another in a fixed
+   arena inside the guest low region so exlaunch's memory scan sees rtld, main,
+   subsdk0, subsdk1 and sdk in that order. */
+void runtime_memory_init(void);
+uint8_t *runtime_arena_alloc(size_t size);
+uint8_t *runtime_module_arena_base(void);
+uint8_t *runtime_module_arena_end(void);
+uint64_t runtime_guest_low_base(void);
+uint64_t runtime_guest_low_size(void);
+int runtime_arena_query(uint64_t address,uint64_t *base,uint64_t *size,unsigned *state,unsigned *permission,unsigned *attribute);
+void mod_window_publish(void);
 void runtime_oe_push_message(uint32_t message);
 void hle_bind_system_event(void *event, int autoclear);
 uint64_t runtime_svc(unsigned num, uint64_t *regs, const char *module, uint64_t offset);
@@ -81,6 +93,7 @@ extern __thread sigjmp_buf *runtime_fault_guard;
 void dm_guest_write_prepare(void *addr,size_t n);
 
 void runtime_trace_guest(uint64_t fp,uint64_t lr);
+void runtime_dump_break_state(uint64_t fp,uint64_t lr);
 
 void runtime_front_run(void(*callback)(void));
 void runtime_boot_progress(const char *stage,uint64_t done,uint64_t total);
@@ -108,7 +121,9 @@ int runtime_aspect_toggle(void);   /* runtime/aspect_patch.h: key 4, 16:9 -> fit
 int runtime_aspect_step(void);     /* key 4's step: 0 16:9, 1 fit to the window, 2 21:9 / TOTK_ASPECT; -1 where unavailable */
 void runtime_aspect_view(double w, double h);   /* frontend.m: the window's drawable size, which key 4 follows */
 float runtime_aspect_now(void);     /* the ratio in force, 0 = the game's own 16:9 */
+float runtime_aspect_wide_ratio(void);   /* the ratio of step 2 (21:9 or TOTK_ASPECT) */
 void runtime_front_resize_aspect(double ratio);   /* Mac: resize the window to a selected picture ratio */
+
 int hud_compact(void);   /* gfx/nvn/fps_overlay.c: the overlay lines go to the window's corner panel (TOTK_HUD=corners: in the picture) */
 int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line 0..3: FPS, shaders, render pipelines, load; 0 = not published */
 

@@ -83,6 +83,20 @@ static void initialize_mouse(void){pthread_mutex_lock(&inputLock);mouseReady=tru
 static void initialize_keyboard(void){pthread_mutex_lock(&inputLock);keyboardReady=true;pthread_mutex_unlock(&inputLock);}
 static int mouse_states(MouseState *out,int max){if(max<=0)return 0;if(!out)runtime_fail("mouse output pointer");pthread_mutex_lock(&inputLock);if(!mouseReady)runtime_fail("mouse used before InitializeMouse");*out=(MouseState){.sampling=++sample};pthread_mutex_unlock(&inputLock);return 1;}
 static void keyboard_state(KeyboardState *out){if(!out)runtime_fail("keyboard output pointer");pthread_mutex_lock(&inputLock);if(!keyboardReady)runtime_fail("keyboard used before InitializeKeyboard");*out=(KeyboardState){.sampling=++sample};pthread_mutex_unlock(&inputLock);}
+/* TouchScreen: nn::hid::TouchScreenState<N> as nn::hid::detail::GetTouchScreenState<5> (sdk+0x499ce0) fills it —
+   u64 sampling number, u32 touch count clamped to N, u32 body slope, N points of 0x28 bytes, u64 tail. */
+typedef struct{int64_t sampling;uint32_t count,slope;unsigned char points[5*0x28];uint64_t tail;} TouchState5;
+_Static_assert(sizeof(TouchState5)==0xe0,"touch screen state ABI");
+static bool touchReady;
+/* The Result-returning entries give 0 = success; the SDK wrappers abort on any other value. */
+static uint32_t initialize_touchscreen(void){pthread_mutex_lock(&inputLock);touchReady=true;pthread_mutex_unlock(&inputLock);return 0;}
+static void touch_state(TouchState5 *out){if(!out)runtime_fail("touch screen output pointer");pthread_mutex_lock(&inputLock);if(!touchReady)runtime_fail("touch screen used before InitializeTouchScreen");*out=(TouchState5){.sampling=++sample};pthread_mutex_unlock(&inputLock);}
+/* UltraCam (subsdk3) reads the singular HID accessors. In the SDK those reach the HID shared-memory detail layer,
+   which this port does not implement, so they serve the same emulated states as the plural forms main uses. */
+static uint32_t single_full(NpadState *out,const uint32_t *id){pad_states(out,1,id,1);return 0;}
+static uint32_t single_handheld(NpadState *out,const uint32_t *id){pad_states(out,1,id,2);return 0;}
+static uint32_t single_disconnected(NpadState *out,const uint32_t *id){disconnected_states(out,1,id);return 0;}
+static uint32_t single_mouse(MouseState *out){mouse_states(out,1);return 0;}
 /* Controller support applet (the Switch's "connect controllers" screen). TOTK opens it in handheld mode; there is
    exactly one controller here, so it returns at once: one player, on the controller in use (ControllerSupportResultInfo:
    int8 player count, 3 bytes padding, uint32 selected id). */
@@ -116,7 +130,11 @@ void *runtime_input_override(const char *name){
  {"_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE",hold_type},{"_ZN2nn3hid14DisconnectNpadERKj",disconnect},
  {"_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE",show_controller_support},
  {"_ZN2nn3hid15InitializeMouseEv",initialize_mouse},{"_ZN2nn3hid18InitializeKeyboardEv",initialize_keyboard},
- {"_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi",mouse_states},{"_ZN2nn3hid16GetKeyboardStateEPNS0_13KeyboardStateE",keyboard_state}
+ {"_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi",mouse_states},{"_ZN2nn3hid16GetKeyboardStateEPNS0_13KeyboardStateE",keyboard_state},
+ {"_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj",single_full},{"_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj",single_handheld},
+ {"_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj",single_disconnected},{"_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj",single_disconnected},
+ {"_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj",single_disconnected},{"_ZN2nn3hid13GetMouseStateEPNS0_10MouseStateE",single_mouse},
+ {"_ZN2nn3hid21InitializeTouchScreenEv",initialize_touchscreen},{"_ZN2nn3hid19GetTouchScreenStateILm5EEEvPNS0_16TouchScreenStateIXT_EEE",touch_state}
 #ifdef GAME_BOTW
  ,{"_ZN2nn3hid28InitializeSevenSixAxisSensorEPvm",seven_axis_init},{"_ZN2nn3hid26FinalizeSevenSixAxisSensorEv",seven_axis_ok},
  {"_ZN2nn3hid23StartSevenSixAxisSensorEv",seven_axis_ok},{"_ZN2nn3hid22StopSevenSixAxisSensorEv",seven_axis_ok},

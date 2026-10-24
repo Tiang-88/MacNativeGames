@@ -34,7 +34,11 @@ enum { BUSY_WAIT_MS = 2000 };
 // 跟踪区间 = 各内存池（MemoryPoolInitialize 登记）。池销毁后复用 live=0 的槽，信号处理里无锁扫描。
 // Tracked ranges = the memory pools (registered by MemoryPoolInitialize). After a pool is destroyed its live=0 slot is reused; the signal handler scans without locks.
 #define MAX_RANGE 16384 // 原为 256：内存池多于它时超出的池不跟踪，里面的贴图每次取用都当成脏的重传（暗黑实测峰值见内存读数行的「内存池」；塞尔达约 300 个，踩过）。扫描只到已用的槽数，容量大不增加开销 | was 256: with more memory pools than that the excess pools are untracked and their textures are treated as dirty and re-uploaded on every use (for Diablo's measured peak see "memory pools" in the memory readout line; Zelda has about 300 and hit this). The scan only covers slots in use, so a larger capacity costs nothing. TOTK (2026-10-17): 4096 was full in the user's own games and most long test games (about 3,900 live pools in the world, more when moving between regions); now 16384
-typedef struct { uintptr_t base, end; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live; _Atomic uint64_t latest; } range_t;   // latest (TOTK): highest page generation in the range
+/* TOTK: cgen[c] = 每 64 页（16 KB 页 → 1 MB）一块里最高的页写代号，在页自己的代号存好之后、latest 和第二次 "now" 之前抬高，
+   所以代号不超过戳的块里不可能有高于戳的页（nvn_dirty_check）。 | cgen[c] = highest page generation among pages
+   [c << CHUNK_SHIFT, (c + 1) << CHUNK_SHIFT) (1 MB of 16 KB pages), raised after the page's own generation is stored. */
+enum { CHUNK_SHIFT = 6 };
+typedef struct { uintptr_t base, end; _Atomic uint8_t *state; _Atomic uint64_t *gen; _Atomic uint64_t *cgen; size_t cap; _Atomic int live; _Atomic uint64_t latest; } range_t;   // latest (TOTK): highest page generation in the range
 #if defined(GAME_BOTW)
 /* BOTW: a pool that shares host pages with live ranges gets ranges for its other pages (the gaps), so ranges never share
    a page and the fault handler still finds at most one range per page. Before, such a pool got no range: its textures
@@ -111,6 +115,7 @@ static void unprotect_page(range_t *r, uintptr_t p) {   // 调用方已把状态
     mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE);
     uint64_t g = atomic_fetch_add(&g_now, 1) + 1, l = atomic_load(&r->latest);
     atomic_store(&r->gen[p], g);
+    { _Atomic uint64_t *c = &r->cgen[p >> CHUNK_SHIFT]; uint64_t cg = atomic_load(c); while (cg < g && !atomic_compare_exchange_weak(c, &cg, g)) {} }   // 在 latest 与第二次 "now" 之前 | before latest and the second "now" step
     while (l < g && !atomic_compare_exchange_weak(&r->latest, &l, g)) {}
     /* TOTK (#90): "now" moves on once more after the page's generation is stored. A checker that read "now" between the
        first step and the stores found the page clean and kept that "now" as its last look (tex_mtl's now == seen); the page
@@ -207,17 +212,18 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     uintptr_t base = (uintptr_t)mem & ~(g_pg - 1), end = ((uintptr_t)mem + size + g_pg - 1) & ~(g_pg - 1);
     size_t np = (end - base) >> g_shift;
     _Atomic uint8_t *state = r->state;
-    _Atomic uint64_t *gen = r->gen;
+    _Atomic uint64_t *gen = r->gen, *cgen = r->cgen;
+    size_t nc = (np + (1u << CHUNK_SHIFT) - 1) >> CHUNK_SHIFT;
     if (r->cap < np) {
-        state = calloc(np, 1); gen = calloc(np, sizeof *gen);
-        if (!state || !gen) die("脏页表分配失败（%zu 页）", np);
+        state = calloc(np, 1); gen = calloc(np, sizeof *gen); cgen = calloc(nc, sizeof *cgen);
+        if (!state || !gen || !cgen) die("脏页表分配失败（%zu 页）", np);
         // 旧数组不 free：信号处理里可能仍有极短暂的陈旧读者，泄漏量 = 每页 9 字节。
         // The old array is not freed: the signal handler may still have a very brief stale reader; leak = 9 bytes per page.
         r->cap = np;
     } else {
-        memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen);
+        memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset((void *)cgen, 0, nc * sizeof *cgen);
     }
-    r->base = base; r->end = end; r->state = state; r->gen = gen; atomic_store(&r->latest, 0);
+    r->base = base; r->end = end; r->state = state; r->gen = gen; r->cgen = cgen; atomic_store(&r->latest, 0);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
     pthread_mutex_unlock(&g_slot_mu);
@@ -267,6 +273,23 @@ int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) {
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // 上传前最后一次写的代号 ≤ 戳；之后的写必 > 戳 | The generation of the last write before upload is <= the stamp; any later write must be > the stamp
     return 0;
 }
+/* TOTK：nvn_dirty_tracked + nvn_dirty_since 合成一次区间查找（原先查两次），页扫描按 64 页一块跳过整块代号不超过戳的块。
+   返回 -1 = 未跟踪（nvn_dirty_tracked 为 0），否则与 nvn_dirty_since 相同。答案不变：每次写页代号之后都会在 latest 和第二次
+   "now" 之前抬高该块代号（unprotect_page），且代号只增。 | one range lookup instead of two; skips each 64-page chunk whose
+   highest generation is at or below the stamp. Returns -1 when untracked, else what nvn_dirty_since returns. */
+int nvn_dirty_check(const void *addr, size_t len, uint64_t stamp) {
+    if (!len) return 0;
+    range_t *r = find((uintptr_t)addr);
+    if (!r || (uintptr_t)addr + len > r->end) return -1;
+    if (atomic_load(&r->latest) <= stamp) return 0;
+    uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+    for (uintptr_t i = p; i <= q; ) {
+        uintptr_t c = i >> CHUNK_SHIFT, ce = ((c + 1) << CHUNK_SHIFT) - 1; if (ce > q) ce = q;
+        if (atomic_load(&r->cgen[c]) > stamp) for (uintptr_t k = i; k <= ce; k++) if (atomic_load(&r->gen[k]) > stamp) return 1;
+        i = ce + 1;
+    }
+    return 0;
+}
 #endif
 #if defined(GAME_BOTW)
 /* BOTW versions of the functions above: a pool's pages can lie in several ranges (its own gaps and the neighbours' shared
@@ -276,15 +299,16 @@ static void range_put(int slot, int n, uintptr_t base, uintptr_t end, const void
     range_t *r = &g_r[slot];
     size_t np = (end - base) >> g_shift;
     _Atomic uint8_t *state = r->state;
-    _Atomic uint64_t *gen = r->gen;
+    _Atomic uint64_t *gen = r->gen, *cgen = r->cgen;
+    size_t nc = (np + (1u << CHUNK_SHIFT) - 1) >> CHUNK_SHIFT;
     if (r->cap < np) {
-        state = calloc(np, 1); gen = calloc(np, sizeof *gen);
-        if (!state || !gen) die("脏页表分配失败（%zu 页）", np);
+        state = calloc(np, 1); gen = calloc(np, sizeof *gen); cgen = calloc(nc, sizeof *cgen);
+        if (!state || !gen || !cgen) die("脏页表分配失败（%zu 页）", np);
         r->cap = np;   // the old arrays are not freed (see nvn_dirty_add_range above)
     } else {
-        memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen);
+        memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset((void *)cgen, 0, nc * sizeof *cgen);
     }
-    r->base = base; r->end = end; r->state = state; r->gen = gen; atomic_store(&r->latest, 0);
+    r->base = base; r->end = end; r->state = state; r->gen = gen; r->cgen = cgen; atomic_store(&r->latest, 0);
     g_rmem[slot] = (uintptr_t)mem; atomic_store(&g_rdying[slot], 0);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
@@ -388,6 +412,11 @@ int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) {
         a = stop;
     }
     return 0;
+}
+int nvn_dirty_check(const void *addr, size_t len, uint64_t stamp) {   // BOTW: the two calls, no chunk table (a span can cross ranges)
+    if (!len) return 0;
+    if (!nvn_dirty_tracked(addr, len)) return -1;
+    return nvn_dirty_since(addr, len, stamp);
 }
 /* GPU writes (as above), over up to 4 ranges */
 typedef struct { int n; range_t *r[4]; uintptr_t p0[4], p1[4]; uint8_t *was[4]; } gpu_write_tok;

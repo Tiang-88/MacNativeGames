@@ -411,12 +411,12 @@ static void patch_output_res(Module *m) {
     fprintf(stderr, "[totk] output resolution patch: swapchain %ux%u (main+0xe996ac), the game's output %s from the data page (main+0xc630a4); texture heap and Graphics +%llu KiB (HeapDef overlay)\n",
             w, h, output_full_at_start ? "at that size" : "1920x1080 for now", (unsigned long long)(runtime_output_res_extra_bytes() >> 10));
 }
-/* Two-state output-size helper retained for internal use: switch between the largest size and 1920x1080. The renderer
-   lays out again at the next frame (see patch_output_res). */
-int runtime_output_res_toggle(void) {
-    if (!output_page) { fprintf(stderr, "[totk] key 3: switching the output size needs a 2K-capable start (TOTK_OUTPUT_RES auto with the HeapDef overlay, or <w>x<h>)\n"); return 0; }
+/* The size switch behind key 3 and the settings menu: the largest size or 1920x1080. The renderer lays out again at
+   the next frame (see patch_output_res). */
+static int output_res_switch(int full, const char *how) {
+    if (!output_page) { fprintf(stderr, "[totk] %s: switching the output size needs a 2K-capable start (TOTK_OUTPUT_RES auto with the HeapDef overlay, or <w>x<h>)\n", how); return 0; }
     _Atomic uint64_t *size = (_Atomic uint64_t *)(void *)(output_page + DP_OUTPUT_SIZE);
-    int full = atomic_load(size) != pack_size(output_w, output_h);
+    if ((atomic_load(size) == pack_size(output_w, output_h)) == full) return 1;   /* already there */
     atomic_store(size, full ? pack_size(output_w, output_h) : pack_size(1920, 1080));
     uint64_t renderer = atomic_load((_Atomic uint64_t *)(void *)(output_page + DP_RENDERER));
     const char *before = "";
@@ -425,10 +425,17 @@ int runtime_output_res_toggle(void) {
         before = old & 0x200u ? " (the previous switch was still pending)" : "";
         runtime_oe_push_message(30);   /* nn::oe "operation mode changed": the game runs its display handler (main+0x1185310) */
     }
-    fprintf(stderr, "[totk] key 3: the game's output %ux%u (%s)%s%s\n", full ? output_w : 1920u, full ? output_h : 1080u,
+    fprintf(stderr, "[totk] %s: the game's output %ux%u (%s)%s%s\n", how, full ? output_w : 1920u, full ? output_h : 1080u,
             full ? "true 2K: the canvas and the UI at that size" : "the 2K output: 1080p canvas, MetalFX scales it at present",
             renderer ? " from the next layout" : "; the game has not laid out its displays yet, it takes this size when it does", before);
     return 1;
+}
+/* Two-state output-size helper retained for internal use: switch between the largest size and 1920x1080. */
+int runtime_output_res_toggle(void) {
+    if (!output_page) return output_res_switch(0, "key 3");
+    _Atomic uint64_t *size = (_Atomic uint64_t *)(void *)(output_page + DP_OUTPUT_SIZE);
+    int full = atomic_load(size) != pack_size(output_w, output_h);
+    return output_res_switch(full, "key 3");
 }
 /* Key 3: cycle the active 2K presentation path. The normal startup is 1080p game output with the MetalFX output scaler
    enabled; native 2K switches the game's canvas/UI to 2560x1440; off returns to 1080p and disables the output scaler. */
@@ -479,7 +486,9 @@ static void check_site(const Module *m, const GamePatch *p) {
 }
 
 /* TOTK_PCHTXT=<file>: an emulator ExeFS patch for main in pchtxt form, as community mods ship them (for example
-   TOTK-Ultrawide's aspect-ratio patch), for trying them here. Mac only: the phone's code is patched at build. Its
+   TOTK-Ultrawide's aspect-ratio patch), for trying them here. With the variable unset, the app's own
+   extracted/<version>/exefs/main.pchtxt is applied when it is there: that is how a mod packaged into the app brings its
+   ExeFS patch, since a Finder launch cannot set an environment. For example Mac only: the phone's code is patched at build. Its
    @nsobid must be main's build id, read from the extracted ExeFS (extracted/<version>/exefs/main at 0x40); the lines
    after @enabled are "<main address> <bytes>", @disabled switches the lines that follow off again (a section the author
    keeps without applying it) and @stop ends the file. "@flag offset_shift 0x100" must come before the first patch line:
@@ -490,7 +499,14 @@ static void check_site(const Module *m, const GamePatch *p) {
    refuse a file that overlaps them. */
 static void patch_pchtxt(Module *m) {
     const char *path = getenv("TOTK_PCHTXT");
-    if (!path || !*path) return;
+    char baked[256];
+    if (!path || !*path) {   /* a mod packaged into the app brings its own patch as extracted/<version>/exefs/main.pchtxt */
+        snprintf(baked, sizeof baked, "extracted/%s/exefs/main.pchtxt", TOTK_GAME_DIR);
+        FILE *probe = fopen(baked, "r");
+        if (!probe) return;
+        fclose(probe);
+        path = baked;
+    }
     FILE *f = fopen(path, "r");
     if (!f) runtime_fail("TOTK_PCHTXT: cannot open the file");
     char nso[256], want[41] = {0}; uint8_t id[20];
@@ -592,6 +608,10 @@ void runtime_game_patches(Module *m) {
     patch_output_res(m);
     patch_slowmo_bounce(m);
     patch_trap(m);
+    if (getenv("TOTK_PCHTXT_DUMP")) {          /* diagnostic: write the runtime main image after every patch */
+        FILE *d = fopen(getenv("TOTK_PCHTXT_DUMP"), "wb");
+        if (d) { fwrite(m->base, 1, m->file_size, d); fclose(d); }
+    }
 #if defined(TOTK_GAME_V121)
     { static const uint64_t sites[] = {0xcb4b10, 0x12521cc, 0x19b36f0, 0x1ecdf68};   /* camera x2, viewport x2 (aspect_patch.h) */
       aspect_install(m, "1.2.1", sites, 4, 2, (m->text_end + 15) & ~15ULL, 0,   /* no free padding for Vert+ stubs */

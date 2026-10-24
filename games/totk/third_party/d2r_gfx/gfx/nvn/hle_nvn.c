@@ -113,9 +113,22 @@ static void *nvn_lookup(const char *name) {
 }
 
 // nvnBootstrapLoader 由 main 导入（sdk 定义）；强制接管后 sdk 的 NVN 驱动不再被引用
-// nvnBootstrapLoader is imported by main (defined in sdk); after it is forcibly taken over, the NVN driver in sdk is no longer referenced
+// nvnBootstrapLoader is imported by main (sdk defines it); after it is forcibly taken over, the NVN driver in sdk is no longer referenced
+/* The game's own driver bootstraps every entry exactly once, so a name asked for a second time comes from a mod
+   that resolved it by itself (UltraCam's NvnBootstrapHook is where its overlay starts). Say so, and say which kind
+   of address it was handed: a mod can only patch guest code, and these are the port's host thunks. */
+static uintptr_t bootstrapped[1024]; static unsigned nbootstrapped;
+static int bootstrap_again(uintptr_t fn) {
+    for (unsigned i = 0; i < nbootstrapped; i++) if (bootstrapped[i] == fn) return 1;
+    if (nbootstrapped < sizeof bootstrapped / sizeof *bootstrapped) bootstrapped[nbootstrapped++] = fn;
+    return 0;
+}
 HLE_FORCE("nvnBootstrapLoader", "NVN 图形接口整块换成宿主空设备（后续 Metal），sdk 的 NVN 驱动不执行",
-          void *, h_nvnBootstrapLoader, const char *name) { return runtime_hle_wrap_named(nvn_lookup(name), name); }
+          void *, h_nvnBootstrapLoader, const char *name) {
+    void *fn = runtime_hle_wrap_named(nvn_lookup(name), name);
+    if (name && fn && bootstrap_again((uintptr_t)fn)) LOG("【红】NVN 二次取址 %s -> %p（宿主跳板：mod 补不了它）", name, fn);
+    return fn;
+}
 
 // ---------- 布尔参数：Switch 调用方不扩展，只看低 8 位 ----------
 // ---------- Boolean parameters: Switch callers do not extend them, only look at the low 8 bits ----------
@@ -201,6 +214,7 @@ NVN(nvnDeviceInstallDebugCallback, void, NVNdevice *d, const PFNNVNDEBUGCALLBACK
     dev_t_ *o = (dev_t_ *)d; o->dbg_cb = B(enable) ? (void *)cb : NULL; o->dbg_data = data;
 }
 NVN(nvnDeviceSetWindowOriginMode, void, NVNdevice *d, NVNwindowOriginMode m) { ((dev_t_ *)d)->origin = m; LOG("[nvn] 窗口原点 %s", m ? "左上（同 D3D / Metal）" : "左下（GL）"); }
+NVN(nvnDeviceGetWindowOriginMode, NVNwindowOriginMode, const NVNdevice *d) { return (NVNwindowOriginMode)((const dev_t_ *)d)->origin; }
 #ifdef GAME_BOTW
 /* NVN's default depth mode is NEAR_IS_MINUS_W (enum value 0, the OpenGL convention): a device the game never calls
    nvnDeviceSetDepthMode on keeps it. TOTK sets it explicitly; Breath of the Wild never does, and its full-screen copy
@@ -297,25 +311,99 @@ NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *b,ptrdiff_t off,size_t siz
 
 // ---------- 描述符池 ----------
 // ---------- Descriptor pools ----------
+/* NVN numbers texture and sampler slots per descriptor pool, but the replay layer has one flat table keyed by the
+   slot the handle carries. A mod that brings its own overlay renderer makes a second pool (UltraCam's ImGui
+   backend: 356 slots against the game's 15256), and its registrations landed on the game's slots: the game's 4x1
+   dummy, registered later, replaced UltraCam's 1024x1024 font atlas at slot 257, so the overlay drew black
+   rectangles where its text should be. Each pool therefore owns a disjoint range of the flat table, and a bind is
+   shifted by the range of the pool its command buffer last selected. A command buffer object has no room left for
+   that (the game allocates exactly 0xA0 bytes for it), so the selection lives in this side table. */
+#define DPOOL_SPAN 0x10000
+typedef struct { const void *pool; int base; } dpool_range;
+static dpool_range g_tex_ranges[8], g_samp_ranges[8];
+static int g_n_tex_ranges, g_n_samp_ranges, g_tex_next, g_samp_next;
+static pthread_mutex_t g_dpool_mu = PTHREAD_MUTEX_INITIALIZER;
+static int dpool_range_take(int is_tex, const void *p, int count) {
+    dpool_range *t = is_tex ? g_tex_ranges : g_samp_ranges;
+    int *n = is_tex ? &g_n_tex_ranges : &g_n_samp_ranges, *next = is_tex ? &g_tex_next : &g_samp_next;
+    for (int i = 0; i < *n; i++) if (t[i].pool == p) return t[i].base;
+    if (*n >= 8 || *next + (uint64_t)count >= 1u << 20) { LOG("【红】描述符池 %p（%d 槽）没有独立的槽号段，与 0 号段共用", p, count); return 0; }
+    int b = *next;
+    *next = b + ((count + DPOOL_SPAN - 1) / DPOOL_SPAN) * DPOOL_SPAN;
+    t[*n] = (dpool_range){p, b};
+    __atomic_thread_fence(__ATOMIC_RELEASE);   // 读端先看到表项，再看到发布它的计数 | a reader must see the entry before the count that publishes it
+    (*n)++;
+    return b;
+}
+static int dpool_range_of(int is_tex, const void *p) {
+    const dpool_range *t = is_tex ? g_tex_ranges : g_samp_ranges;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    int n = is_tex ? g_n_tex_ranges : g_n_samp_ranges;
+    for (int i = 0; i < n; i++) if (t[i].pool == p) return t[i].base;
+    return 0;
+}
+typedef struct { const void *cb; int tb, sb; } cb_pools;
+static cb_pools g_cb_pools[64]; static int g_n_cb_pools;
+static cb_pools *cb_pools_at(const void *c) {
+    for (int i = 0; i < g_n_cb_pools; i++) if (g_cb_pools[i].cb == c) return &g_cb_pools[i];
+    if (g_n_cb_pools >= 64) return NULL;
+    g_cb_pools[g_n_cb_pools] = (cb_pools){c, 0, 0};
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    return &g_cb_pools[g_n_cb_pools++];
+}
+static void cb_pools_note(const void *c, int base, int is_tex) {
+    if (!c) return;
+    pthread_mutex_lock(&g_dpool_mu);
+    cb_pools *e = cb_pools_at(c);
+    if (e) { if (is_tex) e->tb = base; else e->sb = base; }
+    pthread_mutex_unlock(&g_dpool_mu);
+}
+static void cb_pools_of(const void *c, int *bt, int *bs) {
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    for (int i = 0; i < g_n_cb_pools; i++) if (g_cb_pools[i].cb == c) { *bt = g_cb_pools[i].tb; *bs = g_cb_pools[i].sb; return; }
+}
+static void cb_pools_forget(const void *c) {
+    pthread_mutex_lock(&g_dpool_mu);
+    for (int i = 0; i < g_n_cb_pools; i++) if (g_cb_pools[i].cb == c) { g_cb_pools[i] = (cb_pools){c, 0, 0}; break; }
+    pthread_mutex_unlock(&g_dpool_mu);
+}
+/* 句柄低 20 位是贴图槽、20 位以上是采样器槽；两者各按自己池的段平移。
+   Bits 0..19 of a handle are the texture slot and bits 20..39 the sampler slot; each shifts by its own pool's range. */
+static uint64_t handle_shift(uint64_t h, int tb, int sb) {
+    return (h & ~(uint64_t)0xFFFFFFFFFull) | ((h & 0xFFFFF) + (uint64_t)tb & 0xFFFFF) | (((h >> 20) + (uint64_t)sb & 0xFFFFF) << 20);
+}
 NVN(nvnTexturePoolInitialize, NVNboolean, NVNtexturePool *tp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
-    *(dpool_t *)tp = (dpool_t){(const pool_t *)p, off, n}; OLOG("TexturePool n=%d", n); mtl_set_tex_pool_n(n); return 1;
+    *(dpool_t *)tp = (dpool_t){(const pool_t *)p, off, n}; OLOG("TexturePool n=%d", n);
+    pthread_mutex_lock(&g_dpool_mu);
+    int base = dpool_range_take(1, tp, n);
+    pthread_mutex_unlock(&g_dpool_mu);
+    mtl_set_tex_pool_n(base + n);
+    if (base) LOG("【蓝】第二个贴图描述符池 %p：%d 槽，槽号平移到 %d", (void *)tp, n, base);
+    return 1;
 }
 NVN(nvnTexturePoolFinalize, void, NVNtexturePool *tp) { (void)tp; }
 extern uint64_t g_frame_pub;
-NVN(nvnTexturePoolRegisterTexture, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) { (void)tp;
+NVN(nvnTexturePoolRegisterTexture, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) {
+    int slot = dpool_range_of(1, tp) + id;
     { static long want = -2; if (want == -2) { const char *e = getenv("DM_NVN_REGLOG"); want = e ? atol(e) : -1; }   // TOTK diagnostic: DM_NVN_REGLOG=<id> logs every registration of that texture id
         static long rf0 = -2, rf1; if (rf0 == -2) { const char *e = getenv("DM_NVN_REGLOG_FRAMES"); rf0 = e ? atol(e) : -1; rf1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : rf0; }   // DM_NVN_REGLOG_FRAMES=a-b: log every registration in those frames
         if ((want >= 0 && id == want) || (rf0 >= 0 && (long)g_frame_pub >= rf0 && (long)g_frame_pub <= rf1)) { const tex_t *x = (const tex_t *)t; const view_t *vv = (const view_t *)v;
-            LOG("[reglog] F%llu id=%d ser=%llu fmt=%#x %ux%u lv%u flags=%#x mem=%p pool=%p off=%lld view=%s vfmt=%#x vlv=%d+%d", (unsigned long long)g_frame_pub, id, (unsigned long long)x->serial, x->d.format, x->d.width, x->d.height, x->d.levels, x->d.flags, (void *)x->mem, (void *)x->pool, (long long)x->off,
+            LOG("[reglog] F%llu id=%d pool=%p ser=%llu fmt=%#x %ux%u lv%u flags=%#x mem=%p tpool=%p off=%lld view=%s vfmt=%#x vlv=%d+%d", (unsigned long long)g_frame_pub, slot, (const void *)tp, (unsigned long long)x->serial, x->d.format, x->d.width, x->d.height, x->d.levels, x->d.flags, (void *)x->mem, (void *)x->pool, (long long)x->off,
                 vv ? "yes" : "no", vv && vv->set_format ? vv->format : 0, vv && vv->set_levels ? vv->base_level : -1, vv && vv->set_levels ? vv->nlevels : 0); } }
-    totk_life_reg(id, (const tex_t *)t);
-    mtl_reg_tex(id, (const tex_t *)t, (const view_t *)v); }
+    totk_life_reg(slot, (const tex_t *)t);
+    mtl_reg_tex(slot, (const tex_t *)t, (const view_t *)v); }
 
 NVN(nvnSamplerPoolInitialize, NVNboolean, NVNsamplerPool *sp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
-    *(dpool_t *)sp = (dpool_t){(const pool_t *)p, off, n}; OLOG("SamplerPool n=%d", n); return 1;
+    *(dpool_t *)sp = (dpool_t){(const pool_t *)p, off, n}; OLOG("SamplerPool n=%d", n);
+    pthread_mutex_lock(&g_dpool_mu);
+    int base = dpool_range_take(0, sp, n);
+    pthread_mutex_unlock(&g_dpool_mu);
+    if (base) LOG("【蓝】第二个采样器描述符池 %p：%d 槽，槽号平移到 %d", (void *)sp, n, base);
+    return 1;
 }
 NVN(nvnSamplerPoolFinalize, void, NVNsamplerPool *sp) { (void)sp; }
-NVN(nvnSamplerPoolRegisterSampler, void, const NVNsamplerPool *sp, int id, const NVNsampler *s) { (void)sp; mtl_reg_samp(id, &((const samp_t *)s)->p); }
+NVN(nvnSamplerPoolRegisterSampler, void, const NVNsamplerPool *sp, int id, const NVNsampler *s) {
+    mtl_reg_samp(dpool_range_of(0, sp) + id, &((const samp_t *)s)->p); }
 
 // ---------- 贴图 ----------
 // ---------- Textures ----------
@@ -731,7 +819,8 @@ static void cb_check(const cmd_t *o, const char *where) {
 #define OP_RESERVE 24                             // 段尾永远留够一条 JUMP / END | Always keep enough room at the segment end for one JUMP / END
 
 NVN(nvnCommandBufferInitialize, NVNboolean, NVNcommandBuffer *c, NVNdevice *d) {
-    memset(c, 0, sizeof(cmd_t)); CB(c)->magic = MAGIC('C', 'M', 'D', 'B'); CB(c)->dev = d; CB(c)->inline_cur = ~0ull; CB(c)->inline_end = 0; return 1;
+    memset(c, 0, sizeof(cmd_t)); CB(c)->magic = MAGIC('C', 'M', 'D', 'B'); CB(c)->dev = d; CB(c)->inline_cur = ~0ull; CB(c)->inline_end = 0;
+    cb_pools_forget(c); return 1;
 }
 NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { free(CB(c)->seg); CB(c)->seg = CB(c)->cur = CB(c)->end = NULL; CB(c)->magic = 0; }
 NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) { CB(c)->cb = cb; }
@@ -901,8 +990,25 @@ typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uin
 #endif
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
+/* TOTK_REPLAY_FAST (default 1; =0 the old paths): one switch shared by the replay's CPU fast paths (nvn_mtl.m reads the
+   same variable). Here: the recording copy is sized by a first walk over the record headers and allocated once, instead
+   of growing from 4 KiB by realloc and trimming at the end (the growth copies and the trim's move were ~500 samples per
+   15 s on the game's recording threads, 2026-10-22 profile). Same bytes, same checks, same order. */
+static int replay_fast(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_REPLAY_FAST"); v = !(e && !atoi(e)); } return v; }
+static size_t flatten_size(const uint8_t *p) {   // bytes of the copy (prefix included); dies as the copy loop would
+    size_t n = sizeof(copy_prefix);
+    for (;;) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
+        if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
+        n += h.size;
+        if (h.op == OP_END) return n;
+        p += h.size;
+    }
+}
 static uint8_t *flatten_recording(const uint8_t *p) {
-    size_t n = sizeof(copy_prefix), cap = 4096; uint8_t *out = malloc(cap);
+    int exact = replay_fast();
+    size_t n = sizeof(copy_prefix), cap = exact ? flatten_size(p) : 4096; uint8_t *out = malloc(cap);
     int bulk_ok = 1; uint32_t last_size = 0;
     if (!out) die("command copy allocation");
     for (;;) {
@@ -916,7 +1022,7 @@ static uint8_t *flatten_recording(const uint8_t *p) {
         if (n + h.size > cap) { while (n + h.size > cap) cap *= 2; out = realloc(out, cap); if (!out) die("command copy allocation"); }
         memcpy(out + n, p, h.size); n += h.size;
         if (h.op == OP_END) {
-            uint8_t *trimmed = realloc(out, n); if (trimmed) out = trimmed;
+            if (!exact || n != cap) { uint8_t *trimmed = realloc(out, n); if (trimmed) out = trimmed; }
             copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
 #ifdef GAME_BOTW
             c->used = 0;
@@ -1774,8 +1880,8 @@ NVN(nvnCommandBufferBindStorageBuffers, void, NVNcommandBuffer *c, NVNshaderStag
 }
 /* DM_NVN_LIFELOG (totk_lifelog.h): one bound handle of a followed texture; for a deferred bind the logged id is the
    value at record time, the replay's "use" lines show the one resolved at submit. */
-static void life_bind(NVNcommandBuffer *c, int op, int st, int slot, const uint64_t *hp, int deferred) {
-    int id = (int)(*hp & 0xFFFFF); uint64_t ser = totk_life_reg_serial(id);
+static void life_bind(NVNcommandBuffer *c, int op, int st, int slot, const uint64_t *hp, int deferred, int bt) {
+    int id = (int)(*hp & 0xFFFFF) + bt; uint64_t ser = totk_life_reg_serial(id);
     if (!ser) return;
     uint64_t caller = guest_main_caller();
     totk_life_log("bind cb=%p %s%s st=%d slot=%d id=%d ser=%llu hp=%p caller=main+%#llx", (void *)c, op == OP_BIND_TEX ? "tex" : "img", deferred ? " deferred" : "",
@@ -1795,9 +1901,15 @@ static void life_bind(NVNcommandBuffer *c, int op, int st, int slot, const uint6
 }
 static void bind_handles_rec(NVNcommandBuffer *c, int op, int st, int first, int n, const uint64_t *h, int deferred) {
     if (n < 0 || n > 32) { LOG("【红】绑定句柄数 %d", n); return; }
-    p_bind_handles *r = RECN(c, op, p_bind_handles, h, n); r->stage = st; r->first = first; r->n = n; r->pad_ = 0;
-    r->src = deferred ? (uint64_t)(uintptr_t)h : 0; memcpy(r->h, h, 8 * n);
-    if (totk_life_on() && (op == OP_BIND_TEX || op == OP_BIND_IMG)) for (int k = 0; k < n; k++) life_bind(c, op, st, first + k, h + k, deferred);
+    int bt = 0, bs = 0;
+    cb_pools_of(c, &bt, &bs);
+    if (op != OP_BIND_TEX && op != OP_BIND_IMG) bt = 0;
+    if (op != OP_BIND_TEX && op != OP_BIND_SAMP) bs = 0;
+    p_bind_handles *r = RECN(c, op, p_bind_handles, h, n);
+    r->stage = st; r->first = first; r->n = n; r->base_t = bt; r->base_s = bs;
+    r->src = deferred ? (uint64_t)(uintptr_t)h : 0;
+    for (int k = 0; k < n; k++) r->h[k] = handle_shift(h[k], bt, bs);
+    if (totk_life_on() && (op == OP_BIND_TEX || op == OP_BIND_IMG)) for (int k = 0; k < n; k++) life_bind(c, op, st, first + k, h + k, deferred, bt);
     hw_fix(CB(c), 16 + 4 * (size_t)n);   /* macro 7 + method 0x1a2c + CB_POS and one 32-bit handle word per binding (64-bit handles: callers override with 16 + 8n) */
 }
 static void bind_handles(NVNcommandBuffer *c, int op, int st, int first, int n, const uint64_t *h) { bind_handles_rec(c, op, st, first, n, h, 0); }
@@ -1825,7 +1937,8 @@ static void resolve_deferred(const uint8_t *p, int depth) {   // read the handle
         else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
             p_bind_handles *b = (p_bind_handles *)(uintptr_t)(p + 8);
             if (b->src && b->n > 0 && b->n <= 32) {
-                uint64_t cur[32]; memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n); g_def_n++;
+                uint64_t cur[32]; for (int k = 0; k < b->n; k++) cur[k] = handle_shift(((const uint64_t *)(uintptr_t)b->src)[k], b->base_t, b->base_s);
+                g_def_n++;
                 if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
                     if (g_def_logged++ < 6) LOG("[nvn] 延迟绑定在提交时读到新句柄：阶段 %d 槽 %d 起，录制时 %#llx → 提交时 %#llx", b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
                     g_def_changed++; memcpy(b->h, cur, 8 * (size_t)b->n);
@@ -1928,8 +2041,17 @@ NVN(nvnCommandBufferDispatchCompute, void, NVNcommandBuffer *c, int x, int y, in
     *REC(c, OP_DISPATCH, p_dispatch) = (p_dispatch){x, y, z, (uint64_t)__builtin_return_address(0)};
 }
 NVN(nvnCommandBufferBarrier, void, NVNcommandBuffer *c, int bits) { *(int32_t *)rec(c, OP_BARRIER, 8) = bits; }
-NVN(nvnCommandBufferSetTexturePool, void, NVNcommandBuffer *c, const NVNtexturePool *p) { REC(c, OP_SET_TEX_POOL, p_set_pool)->pool = (const dpool_t *)p; }
-NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerPool *p) { REC(c, OP_SET_SAMP_POOL, p_set_pool)->pool = (const dpool_t *)p; }
+/* Which descriptor pool a command buffer binds through decides the slot range of every handle it records. */
+static void dpool_select(const void *c, const void *p, int is_tex) {
+    int base = dpool_range_of(is_tex, p);
+    cb_pools_note(c, base, is_tex);
+    static const void *seen[16]; static int nseen;
+    for (int i = 0; i < nseen; i++) if (seen[i] == p) return;
+    if (nseen < 16) seen[nseen++] = p;
+    LOG("【蓝】%s描述符池 %p 选入命令缓冲 %p：槽号段 %d", is_tex ? "贴图" : "采样器", p, c, base);
+}
+NVN(nvnCommandBufferSetTexturePool, void, NVNcommandBuffer *c, const NVNtexturePool *p) { REC(c, OP_SET_TEX_POOL, p_set_pool)->pool = (const dpool_t *)p; dpool_select(c, p, 1); }
+NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerPool *p) { REC(c, OP_SET_SAMP_POOL, p_set_pool)->pool = (const dpool_t *)p; dpool_select(c, p, 0); }
 
 NVN(nvnCommandBufferCopyBufferToTexture, void, NVNcommandBuffer *c, NVNbufferAddress src, const NVNtexture *t, const NVNtextureView *v,
     const NVNcopyRegion *r, int flags) {
@@ -2711,6 +2833,7 @@ static int uncapped_cap(int scr) {
     int v = !e ? UNCAPPED_DEFAULT_HZ : !strcmp(e, "display") ? (scr > 0 ? scr : 60) : atoi(e);
     return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
 }
+static _Atomic int g_fps_cap;              /* 0 = none, else the fastest rate allowed */
 void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; }
 static void present_cfg(const win_t *o) {
     if (g_hz >= 0) return;
@@ -2759,7 +2882,10 @@ static uint64_t present_period(const win_t *o) {
                                     m == MFX_MAX ? (g_uncapped ? "补帧 不限帧：不限帧率，每帧补一帧" : "补帧 不限帧：按游戏的出图间隔，每帧补一帧") :
                                     g_uncapped ? "补帧关：不限帧率" : "补帧关：按游戏的出图间隔"); was = m; }
     if (m == MFX_30 || game_holds_30()) return 1000000000ull / 30;   /* exactly 30 fps, by display ticks or by our own clock */
-    return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
+    uint64_t period = hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
+    int cap = atomic_load(&g_fps_cap);   /* settings menu: a cap only lengthens the wait, never shortens it */
+    if (cap > 0) { uint64_t lim = 1000000000ull / (uint64_t)cap; if (period < lim) period = lim; }
+    return period;
 }
 /* Exercise production policy, including the shrine's interval=2 and the
    legacy 30 FPS path. No sleep, present or GPU allocation is involved. */
@@ -2819,6 +2945,17 @@ int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否�
 static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame) {
     gfx_enter();
     { void mtl_shot_at_present(const tex_t *t); if (idx >= 0 && idx < o->ntex && idx < 4) mtl_shot_at_present(CTX(o->tex[idx])); }
+    { /* TOTK_TEX_SHOT=<every>:<path with %d = the texture's index>: every swapchain picture of this frame, see mtl_shot_tex. */
+      static const char *ts; static long every, got; static int read;
+      if (!read) { read = 1; const char *e = getenv("TOTK_TEX_SHOT");
+          if (e && strchr(e, ':')) { ts = e; every = atol(e) > 0 ? atol(e) : 1; } }
+      if (ts && o->presents && (long)o->presents % every == 0 && got < 4 * every) {
+          extern void mtl_shot_tex(const tex_t *t, const char *path);
+          for (int i = 0; i < o->ntex && i < 4; i++, got++) {
+              char path[1024]; snprintf(path, sizeof path, strchr(ts, ':') + 1, i); mtl_shot_tex(CTX(o->tex[i]), path);
+          }
+      }
+    }
     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), period, (int *)crop);   // 只入队，立即返回 | enqueue only, return immediately
     if (frame) mtl_set_frame(frame);
     gfx_leave();

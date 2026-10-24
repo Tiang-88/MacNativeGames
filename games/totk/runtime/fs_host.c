@@ -31,7 +31,7 @@
 #else
 #define TOTK_APPLICATION_ID 0x0100f2c0115b6000ULL
 #endif
-enum { M_FREE, M_SAVE, M_TEMP, M_CACHE };
+enum { M_FREE, M_SAVE, M_TEMP, M_CACHE, M_SD };
 enum { OPEN_READ = 1, OPEN_WRITE = 2, OPEN_APPEND = 4 };
 #define FILE_BASE 0x200000000ULL
 #define DIR_BASE 0x300000000ULL
@@ -45,7 +45,7 @@ static Mount mounts[16];
 static File files[NFILES];
 static Dir dirs[NDIRS];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static char profile[1024], save_root[1024];
+static char profile[1024], save_root[1024], sd_root[1024];
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 
 static void need(int c, const char *m) { if (!c) runtime_fail(m); }
@@ -81,6 +81,8 @@ static void init(void) {
     make_dir(save_root);                                   /* launcher-style EnsureSaveData */
     snprintf(p, sizeof p, "%s/temp", profile); remove_tree(p); make_dir(p);
     snprintf(p, sizeof p, "%s/cache", profile); make_dir(p);
+    snprintf(p, sizeof p, "%s/sdcard", profile); make_dir(p);
+    need(snprintf(sd_root, sizeof sd_root, "%s/sdcard", profile) < (int)sizeof sd_root, "sd card path");
     fprintf(stderr, "[totk] host save storage: %s\n", save_root);
 }
 static void ready(void) { pthread_once(&once, init); }
@@ -143,6 +145,9 @@ static unsigned mount_save_ro(const char *name, uint64_t application, const uint
     return mount_add(name, M_SAVE, save_root);
 }
 static unsigned mount_temp(const char *name) { ready(); char p[1100]; snprintf(p, sizeof p, "%s/temp", profile); return mount_add(name, M_TEMP, p); }
+/* The SD card: mods read their own data from sd:/ (UltraCam keeps its configuration and actor lists
+   under sd:/UltraCam/TOTK/). This host has no removable card, so the profile directory is the card. */
+static unsigned mount_sd(const char *name) { ready(); return mount_add(name, M_SD, sd_root); }
 static void cache_dir(int index, char *out, size_t cap) { snprintf(out, cap, "%s/cache/%d", profile, index); }
 static unsigned create_cache(int index, int64_t size, int64_t journal) {
     ready(); if (index < 0 || size < 0 || journal < 0) return R_INVALID_ARGUMENT;
@@ -307,6 +312,21 @@ static void close_directory(uint64_t h) {
 }
 /* The fs priority only orders I/O inside the system fs process; host I/O is unordered. */
 static void set_priority(int priority) { (void)priority; }
+/* Total entries the handle's directory holds for its open mode, independent of the read position (the guest
+   asks this before reading, to size its buffer). */
+static unsigned directory_entry_count(int64_t *out, uint64_t h) {
+    if (h < DIR_BASE || h >= DIR_BASE + NDIRS || !out) return R_INVALID_ARGUMENT;
+    Dir *d = &dirs[h - DIR_BASE]; if (!d->dir) return R_INVALID_ARGUMENT;
+    DIR *s = opendir(d->path); if (!s) return errno_result();
+    int64_t n = 0; struct dirent *e;
+    while ((e = readdir(s))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || strlen(e->d_name) > 768) continue;
+        char child[2048]; snprintf(child, sizeof child, "%s/%s", d->path, e->d_name); struct stat st; if (stat(child, &st)) continue;
+        int is_dir = S_ISDIR(st.st_mode); if (!(d->mode & (is_dir ? 1 : 2))) continue;
+        n++;
+    }
+    closedir(s); *out = n; return 0;
+}
 
 /* make probe-save: the "save in progress" state the window close waits on, through the fs entry points the game uses
    (a fresh profile in build/probe-save-profile; no game). */
@@ -351,16 +371,16 @@ void *runtime_fs_host_override(const char *name) {
         {"_ZN2nn2fs10CreateFileEPKcl", create_file}, {"_ZN2nn2fs10DeleteFileEPKc", delete_file}, {"_ZN2nn2fs10RenameFileEPKcS2_", rename_file},
         {"_ZN2nn2fs15CreateDirectoryEPKc", create_directory}, {"_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc", delete_recursive},
         {"_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", open_directory},
+        {"_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", directory_entry_count},
         {"_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", read_directory},
         {"_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", close_directory},
         {"_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", mount_save},
         {"_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", mount_save_ro},
         {"_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", save_exists},
-        {"_ZN2nn2fs21MountTemporaryStorageEPKc", mount_temp}, {"_ZN2nn2fs7UnmountEPKc", unmount}, {"_ZN2nn2fs6CommitEPKc", commit},
+        {"_ZN2nn2fs21MountTemporaryStorageEPKc", mount_temp}, {"_ZN2nn2fs11MountSdCardEPKc", mount_sd}, {"_ZN2nn2fs7UnmountEPKc", unmount}, {"_ZN2nn2fs6CommitEPKc", commit},
 #ifdef GAME_BOTW
         {"_ZN2nn2fs14CommitSaveDataEPKc", commit},   /* SDK 7 (Breath of the Wild 1.6.0) */
 #endif
-       
         {"_ZN2nn2fs18CreateCacheStorageEill", create_cache}, {"_ZN2nn2fs18DeleteCacheStorageEi", delete_cache},
         {"_ZN2nn2fs17MountCacheStorageEPKci", mount_cache},
         {"_ZN2nn2fs20OpenCacheStorageListEPNS0_22CacheStorageListHandleE", open_cache_list},

@@ -586,6 +586,7 @@ def site_window(seg):
 m0 = struct.unpack_from('<I', IMG, 4)[0]
 assert IMG[m0:m0 + 4] == b'MOD0'
 ehs = m0 + struct.unpack_from('<i', IMG, m0 + 16)[0]
+ehe = m0 + struct.unpack_from('<i', IMG, m0 + 20)[0]
 def rd(o, enc):
     fmt, app = enc & 0xF, enc & 0x70
     v, sz = {0x3: (struct.unpack_from('<I', IMG, o)[0], 4), 0xB: (struct.unpack_from('<i', IMG, o)[0], 4),
@@ -595,13 +596,19 @@ def rd(o, enc):
     return v, sz
 _, penc, cenc, tenc = IMG[ehs:ehs + 4]
 o = ehs + 4
-_, s = rd(o, penc); o += s
-nfde, s = rd(o, cenc); o += s
 starts = set()
-for _ in range(nfde):
-    a, s = rd(o, tenc); o += s
-    _, s = rd(o, tenc); o += s
-    starts.add(a)
+if ehe <= ehs + 4:
+    # TOTK's subsdk1 ships an empty .eh_frame_hdr (start == end): there are no
+    # function boundaries. The scans below only use them as context for the
+    # exclusive windows and jump tables, so the whole text is one region.
+    starts.add(0)
+else:
+    _, s = rd(o, penc); o += s
+    nfde, s = rd(o, cenc); o += s
+    for _ in range(nfde):
+        a, s = rd(o, tenc); o += s
+        _, s = rd(o, tenc); o += s
+        starts.add(a)
 starts = sorted(x for x in starts if x < TEXT_END)
 
 # ---- 线性扫描找全部改写点（不靠寄存器读写报告）----

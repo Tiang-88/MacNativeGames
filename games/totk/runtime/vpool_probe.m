@@ -77,12 +77,25 @@ void runtime_vpool_probe(void){
  expect(!map(&v1,&v2,0,0,PAGE),"reject virtual pool as physical source");
  expect(!map(&phys,&phys,0,0,PAGE),"reject physical pool as mapping target");
  expect(all(mem(&v1),0x3a,PAGE),"rejected requests did not change mappings");
- pool_init(&bad,raw+0x1000,size,0x104,0);expect(1,"reject CPU-visible unaligned physical pool");
+ // A CPU-visible physical pool the game cannot remap (its storage starts mid host page) gets aligned storage of its
+ // own instead of failing: UltraCam's ImGui backend allocates like this, and refusing it left the mod unmapped.
+ uint8_t *raw2=NULL;if(posix_memalign((void **)&raw2,PAGE,size+PAGE))runtime_fail("probe storage 2");
+ memset(raw2+0x1000,0xee,size);
+ pool_init(&bad,raw2+0x1000,size,0x104,1);
+ expect(mem(&bad)!=raw2+0x1000&&((uintptr_t)mem(&bad)%getpagesize())==0,"misaligned CPU-visible physical pool gets aligned host pages");
+ expect(CALL(nvnMemoryPoolMap,&bad)==mem(&bad),"the guest maps the aligned storage, not its own rejected range");
+ expect(all(mem(&bad),0xee,size),"the pool snapshot keeps what the caller already wrote");
+ NVNmemoryPool v3;pool_init(&v3,NULL,size,0x2a1,1);
+ expect(map(&v3,&bad,0,0,size),"virtual pool maps over the aliased physical pool");
+ memset(mem(&bad)+PAGE,0x9b,PAGE);
+ expect(all(mem(&v3)+PAGE,0x9b,PAGE),"a CPU write through the physical view is visible through the alias");
+ CALL(nvnMemoryPoolFinalize,&v3);CALL(nvnMemoryPoolFinalize,&bad);
+ free(raw2);
  // Unmap V1 page 0: reads zero again, the physical page keeps its data for V2.
  expect(map(&v1,NULL,0,0,PAGE),"unmap virtual page");
  expect(all(mem(&v1),0,PAGE),"unmapped virtual page reads zero");
  expect(all(mem(&v2)+PAGE,0x3a,PAGE),"physical data survives unmap of another alias");
  CALL(nvnMemoryPoolFinalize,&v1);CALL(nvnMemoryPoolFinalize,&v2);CALL(nvnMemoryPoolFinalize,&phys);
  free(raw);
- printf("{\"status\":\"pass\",\"checks\":%d,\"request_bytes\":%zu,\"page_bytes\":%llu,\"scope\":\"NVNmappingRequest layout from runtime dump; CPU and Metal GPU aliasing between two virtual pools of one physical pool; unmap; 6 negative controls; no drawing\"}\n",checks,sizeof(totk_mapping_request),(unsigned long long)PAGE);
+ printf("{\"status\":\"pass\",\"checks\":%d,\"request_bytes\":%zu,\"page_bytes\":%llu,\"scope\":\"NVNmappingRequest layout from runtime dump; CPU and Metal GPU aliasing between two virtual pools of one physical pool; unmap; 6 negative controls; a CPU-visible physical pool that needs aligned host storage; no drawing\"}\n",checks,sizeof(totk_mapping_request),(unsigned long long)PAGE);
 }

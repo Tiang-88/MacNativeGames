@@ -23,6 +23,7 @@
 #include <dirent.h>
 #include <stdatomic.h>
 #include "totk_shader_seed.h"
+#include "totk_early_z.h"
 #include "totk_shader_observed.h"
 #include "totk_shader_contrib.h"
 extern void runtime_boot_status(const char *,const char *) __attribute__((weak_import));
@@ -324,6 +325,11 @@ static NSMutableDictionary *variant_request(NSString *shader, int stage, const u
     uint32_t c1o, c1t; memcpy(&c1o, control + 0x700, 4); memcpy(&c1t, control + 0x704, 4);
     if (!c1t || c1t > 16u << 20 || c1o > c1t || (stage != 5 && c1o < 0x30)) die("shader %s: code area %#x / c1 %#x", shader.UTF8String, c1t, c1o);
     if (!stage_name(stage)) die("shader %s: NVN stage %d has no translation chain (tessellation/geometry)", shader.UTF8String, stage);
+    /* TOTK_EARLY_Z: the fragment shader's control byte +0x718 asks for early fragment tests (the rule of
+       tools/early_z_keys.py; BOTW's shorter sections are not read). Noted before the translation returns, so shader_load
+       compiles its MSL with the attribute even though this variant is not in the seed's key list. */
+    if (stage == 1 && control) { uint32_t size; memcpy(&size, control + 0x20, 4);
+        if (!(size >= 0x7cc && size < 0x880) && (control[0x718] & 1)) totk_early_z_note(shader.UTF8String); }
     uint8_t md[32]; NSData *ad = [json_string(answers) dataUsingEncoding:NSUTF8StringEncoding]; CC_SHA256(ad.bytes, (CC_LONG)ad.length, md);
     NSString *variant = [NSString stringWithFormat:@"%@-%@", shader, hex(md, 6)];
     NSString *code_path = [totk_rt_dir() stringByAppendingFormat:@"/%@.code", variant];
