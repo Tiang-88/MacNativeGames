@@ -31,9 +31,11 @@ void dm_guest_write_prepare(void *addr,size_t n){dm_host_write_pc=(uint64_t)__bu
 #include <mach/mach.h>
 #include "mach_vm_compat.h"
 #include <sys/ucontext.h>
-static uintptr_t watch_lo,watch_hi,watch_addr,watch_end;static long watch_from=300;static int watch_hits,watch_init,watch_read;
+static uintptr_t watch_lo,watch_hi,watch_addr,watch_end;static long watch_from=300;static int watch_hits,watch_init,watch_read,watch_guest_only,watch_host_hits;static _Atomic uint64_t watch_tag;
+static int watch_value;   /* TOTK_WATCH_VALUE=1: a read hit also logs the 16 bytes read (what the CPU's decision sees) */
 static unsigned char watch_snap[32];static int watch_snap_valid;static _Atomic int watch_armed;   /* TOTK: content poll at every present + periodic re-arm (an unrelated write in the page unprotects it; without re-arm the block's own write in the same frame is missed) */
-static void *watch_rearm_thread(void *arg){(void)arg;for(;;){usleep(100);if(watch_lo&&atomic_load(&watch_armed))mprotect((void *)watch_lo,watch_hi-watch_lo,watch_read?PROT_NONE:PROT_READ);}return NULL;}
+static void *watch_rearm_thread(void *arg){(void)arg;for(;;){usleep(100);if(watch_lo&&atomic_load(&watch_armed)&&watch_hits<200)mprotect((void *)watch_lo,watch_hi-watch_lo,watch_read?PROT_NONE:PROT_READ);}return NULL;}
+void runtime_watch_tag(uint64_t ser){atomic_store(&watch_tag,ser);}
 int runtime_module_offset(uint64_t pc,const char **name,uint64_t *off);
 static void watch_hex(char *b,size_t *n,const char *label,uint64_t v){while(*label)b[(*n)++]=*label++;b[(*n)++]='0';b[(*n)++]='x';for(int i=15;i>=0;i--)b[(*n)++]="0123456789abcdef"[(v>>(i*4))&15];}
 static void watch_sym(char *b,size_t *n,const char *label,uint64_t pc){const char *nm;uint64_t off;while(*label)b[(*n)++]=*label++;if(runtime_module_offset(pc,&nm,&off)){while(*nm)b[(*n)++]=*nm++;watch_hex(b,n,"+",off);}else watch_hex(b,n,"host:",pc);}
@@ -42,7 +44,13 @@ static void watch_sym(char *b,size_t *n,const char *label,uint64_t pc){const cha
 int totk_vpool_backing(uintptr_t va,uint64_t len,uintptr_t *cpu);
 void runtime_watch_set(uintptr_t addr,size_t len){
  { uintptr_t cpu=0; if(totk_vpool_backing(addr,len?len:256,&cpu)&&cpu){char b[160];size_t n=0;watch_hex(b,&n,"[watch] virtual pool address ",addr);watch_hex(b,&n," -> CPU backing ",cpu);b[n++]=10;write(2,b,n);addr=cpu;} }
- watch_addr=addr;watch_end=addr+(len?len:256);watch_lo=addr&~(uintptr_t)0x3fff;watch_hi=(watch_end+0x3fff)&~(uintptr_t)0x3fff;watch_hits=0;
+ if(watch_lo&&(addr&~(uintptr_t)0x3fff)!=watch_lo)mprotect((void *)watch_lo,watch_hi-watch_lo,PROT_READ|PROT_WRITE);   /* retarget: release the old range */
+ watch_addr=addr;watch_end=addr+(len?len:256);watch_lo=addr&~(uintptr_t)0x3fff;watch_hi=(watch_end+0x3fff)&~(uintptr_t)0x3fff;watch_hits=0;watch_host_hits=0;
+ /* TOTK: a watch armed at runtime (a render target the graph; TOTK_WATCH_TEX / TOTK_WATCH_SER) must be in place before
+    the next CPU access, not at the next present: read mode is taken from the environment and the pages are closed now. */
+ if(getenv("TOTK_WATCH_READ")){ watch_read=1; watch_init=1; watch_guest_only=getenv("TOTK_WATCH_GUEST")!=NULL; watch_value=getenv("TOTK_WATCH_VALUE")!=NULL;
+  static int started; if(!started){started=1;pthread_t t;pthread_create(&t,NULL,watch_rearm_thread,NULL);}
+  atomic_store(&watch_armed,1); mprotect((void *)watch_lo,watch_hi-watch_lo,PROT_NONE); }
  char b[160];size_t n=0;watch_hex(b,&n,"[watch] range set addr=",addr);watch_hex(b,&n," end=",watch_end);watch_hex(b,&n," pages=",(watch_hi-watch_lo)>>14);b[n++]=10;write(2,b,n);
 }
 void runtime_watch_tick(uint64_t frame){
@@ -56,10 +64,22 @@ void runtime_watch_tick(uint64_t frame){
 static int watch_fault(void *addr,int is_write,void *context){
  uintptr_t a=(uintptr_t)addr;if(!watch_lo||a<watch_lo||a>=watch_hi)return 0;
  if(a<watch_addr||a>=watch_end){mprotect((void *)watch_lo,watch_hi-watch_lo,PROT_READ|PROT_WRITE);return 1;}   /* other data in the pages: silently unprotect (re-armed at the next present) */
- ucontext_t *u=context;char b[1024];size_t n=0;
+ ucontext_t *u=context;
+ /* TOTK: TOTK_WATCH_GUEST=1 keeps only accesses made by guest code (pc resolves to a module). The port's own present path,
+    write-back snapshot and upload scan read every render target each frame, which used to drown out the guest's reads. */
+ if(watch_guest_only){const char *nm;uint64_t off;if(!runtime_module_offset(u->uc_mcontext->__ss.__pc,&nm,&off)){
+   if (++watch_host_hits>200000){atomic_store(&watch_armed,0);watch_lo=0;}   /* host readers would fault every frame: give up eventually */
+   mprotect((void *)watch_lo,watch_hi-watch_lo,PROT_READ|PROT_WRITE);return 1;}}
+ char b[1024];size_t n=0;
  { extern uint64_t g_frame_pub; extern _Atomic int dm_submit_busy; uint64_t th=0; pthread_threadid_np(NULL,&th);
-   watch_hex(b,&n,"[watch] F",g_frame_pub);watch_hex(b,&n," t_us=",clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000);watch_hex(b,&n," th=",th);watch_hex(b,&n," submit_busy=",(uint64_t)atomic_load(&dm_submit_busy)); }
+   watch_hex(b,&n,"[watch] F",g_frame_pub);watch_hex(b,&n," ser=",atomic_load(&watch_tag));watch_hex(b,&n," t_us=",clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000);watch_hex(b,&n," th=",th);watch_hex(b,&n," submit_busy=",(uint64_t)atomic_load(&dm_submit_busy)); }
  watch_hex(b,&n,is_write?" write hit addr=":" read hit addr=",a);watch_hex(b,&n," off=",a-watch_addr);
+ if(!is_write&&watch_value&&n<sizeof b-64){   /* the bytes the reader is about to see (page unprotected first: it is PROT_NONE now) */
+   mprotect((void *)watch_lo,watch_hi-watch_lo,PROT_READ|PROT_WRITE);
+   const volatile uint32_t *v=(const volatile uint32_t *)a;b[n++]=' ';b[n++]='v';b[n++]='=';
+   for(int i=0;i<4;i++){uint32_t w=v[i];for(int k=7;k>=0;k--)b[n++]="0123456789abcdef"[(w>>(k*4))&15];b[n++]=' ';
+     if(n>sizeof b-64)break;}
+ }
  watch_sym(b,&n," pc=",u->uc_mcontext->__ss.__pc);watch_sym(b,&n," lr=",u->uc_mcontext->__ss.__lr);
  uint64_t fp=u->uc_mcontext->__ss.__fp;for(int d=0;d<8&&fp&&!(fp&15);d++){uint64_t fr[2];mach_vm_size_t got=0;if(mach_vm_read_overwrite(mach_task_self(),fp,16,(uintptr_t)fr,&got)!=KERN_SUCCESS||got!=16)break;watch_sym(b,&n," <",fr[1]);fp=fr[0];}
  b[n++]='\n';write(2,b,n);watch_hits++;
