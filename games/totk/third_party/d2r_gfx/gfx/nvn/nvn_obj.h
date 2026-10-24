@@ -258,16 +258,24 @@ void botw_tiny_commit(void);
 #define BOTW_DEAD_KEEP(k)
 #define BOTW_TEX_RELEASE_KEEP(k)
 #define BOTW_DEAD_FORGET(s, n)
-#define BOTW_WB_ENT_FIELDS uint64_t fence;
-#define BOTW_WB_NOTED(e, k) (e)->fence = g_fence + 1;
-#define BOTW_WB_STAGE_FREE(e)
-#define BOTW_WB_STAGE()
+/* TOTK: targets the CPU polls without an invalidate (up to 64 KiB) are staged like the BotW water colours: the
+   submission that renders one copies it into a shared buffer at its end, so the fence wait that follows swizzles the
+   bytes on the CPU instead of injecting another blit round trip into the queue (grass cut map, issue #49). */
+#define BOTW_WB_ENT_FIELDS uint64_t fence; void *stage; uint64_t stage_fence;
+/* note for the stage copy only the small targets the fence write-back takes (WB_FENCE_SMALL_MAX) */
+#define BOTW_WB_NOTED(e, k) (e)->fence = g_fence + 1; if ((e)->t.L.size <= (64u << 10)) botw_wb_sub_note(k);
+#define BOTW_WB_STAGE_FREE(e) if ((e)->stage) { defer_obj_release((__bridge id)(e)->stage); CFRelease((e)->stage); }
+void botw_wb_sub_note(uint64_t serial);
+void botw_wb_stage_encode(void);
+#define BOTW_WB_STAGE() botw_wb_stage_encode();
 int totk_wb_fence_on(void);
 /* TOTK_WB_FENCE=0 waits for all submitted GPU work, as before. Otherwise a write-back waits only for the submissions that
    rendered the listed textures (the game waits for its own sync before invalidating), then for uploads to finish. */
-#define WB_WAIT_GPU(list, nl) { uint64_t need_ = 0; for (int i_ = 0; i_ < (nl); i_++) if ((list)[i_]->fence > need_) need_ = (list)[i_]->fence; \
+#define WB_WAIT_GPU(list, nl) { uint64_t need_ = 0; for (int i_ = 0; i_ < (nl); i_++) { if ((list)[i_]->fence > need_) need_ = (list)[i_]->fence; \
+        if ((list)[i_]->stage_fence > need_) need_ = (list)[i_]->stage_fence; } \
     if (totk_wb_fence_on()) { if (need_) mtl_wait(need_, UINT64_MAX); while (atomic_load(&g_up_pending)) usleep(1000); } else mtl_finish_gpu(); }
-#define BOTW_WB_FROM_STAGE(e, ok, layers)
+int botw_wb_from_stage(void *e);
+#define BOTW_WB_FROM_STAGE(e, ok, layers) { int s_ = botw_wb_from_stage(e); if (s_ >= 0) { (ok) = s_; (layers) = 0; } }
 #define BOTW_TINY_NOTE(t, o)
 #define BOTW_TINY_COMMIT()
 #define UNCAPPED_INTERVAL_FROM_ENV(e) e && atoi(e)
@@ -366,6 +374,7 @@ void mtl_create_stats(uint64_t *lib, uint64_t *pso);   // 累计：提交线程�
 // CPU texture read: starting at level / layer0, written into dst with row / img byte strides
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img);
 void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);   // TOTK: CPU texel write (WriteTexels)
+void mtl_flush_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r);   // TOTK: GPU texels made visible in the pool memory the CPU reads (FlushTexels)
 // 描述符池登记（贴图号 / 采样器号 → 对象快照）、程序释放
 // Descriptor pool registration (texture ID / sampler ID → object snapshot), program release
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v);

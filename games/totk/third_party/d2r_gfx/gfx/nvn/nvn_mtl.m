@@ -2205,12 +2205,18 @@ static void chunk_maybe_split(void) {
     if (by_time) g_chunk_time_commits++;
 }
 uint64_t mtl_sub_commit(void) {
+#ifndef GAME_BOTW
+    void totk_mask_commit(void);   // TOTK grass masks (end of this file)
+#endif
     cg_flush();   // TOTK: cube-face-set groups still pending at the end of the submission (reason 4 in the stats line)
     defer_fallback();   // 推迟合并通道：提交结束仍有未回放的 P 绘制（正常路径不会到这里） | Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
     rp_flush();
     usnap_finish();   // TOTK: the helper threads must be done with the copies (they are, long before this)
     g_nusnap = 0; g_mat_gen++;   // TOTK: the replay is done; the uniform copies stay in this submission's arena until it completes
     upd_flush(); BOTW_WB_STAGE() BOTW_TINY_COMMIT()   // TOTK: renamed uniform updates reach memory here, after every draw that read them through private copies
+#ifndef GAME_BOTW
+    totk_mask_commit();   // TOTK: the grass masks are copied out in this submission, into memory when it completes
+#endif
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     rs_sub_end();   // TOTK: encode stage drained before the command buffer is ended
     up_flush();
@@ -2599,12 +2605,17 @@ static void pkg_owned_locked(uint64_t k) {
 typedef struct { tex_t t; uint64_t stamp; void *obj; uint8_t *snap; uint32_t snap_n; BOTW_WB_ENT_FIELDS } wb_ent;   // snap: the texture's own bytes when the rendering was noted (small targets only)
 static nvn_hmap g_wb = {.klen = 8};   // serial -> wb_ent * (g_smu): rendered since the last write-back
 static _Atomic int g_wb_on = 1;
+static _Atomic int g_wb_fence_small = -1;   // -1: from TOTK_WB_FENCE_SMALL; "flag wb_fence_small 0|1" switches it while the game runs
+static _Atomic int g_wb_sig = -1;           // TOTK_WB_SIG: [writeback] sig lines with the pool bytes of small targets
+static int wb_fence_small_on(void);
+static void wb_sig_note(const tex_t *t);
 static void wb_drop_all(void);
 /* TOTK: fill the driver segment c0 for vertex and compute shaders (thread-group counts, uniform / storage address tables,
    point size limit; see drv_scan). TOTK_DRV_FILL=0 or "flag drvfill 0" gives them the old all-zero segment (A/B only). */
 static _Atomic int g_drvfill_on = -1;
 static int drvfill_on(void) { int v = atomic_load(&g_drvfill_on); if (v < 0) { const char *e = getenv("TOTK_DRV_FILL"); v = !(e && !strcmp(e, "0")); atomic_store(&g_drvfill_on, v); } return v; }
 static uint64_t g_wb_done, g_wb_skip_cpu, g_wb_skip_fmt, g_wb_bytes;
+static uint64_t g_wb_ns_wait, g_wb_ns_stage;   /* write-back: time waiting for GPU fences, time swizzling staged copies */
 /* TOTK diagnostics for the game's occlusion culling (a 256x144 occluder depth pass, then one SAMPLES_PASSED query per
    candidate object with a bounding-sphere proxy; an object whose query reports 0 is not drawn): "flag occl_visible 1"
    reports every query as visible (if a vanished object comes back, the culling decided it); "querylog <frames>" logs
@@ -2689,6 +2700,8 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "drv_cache")) { driver_cache_set(v); return; }
     if (!strcmp(name, "drv_cache_check")) { driver_cache_check_set(v); return; }
     if (!strcmp(name, "writeback")) { if (!v) wb_drop_all(); atomic_store(&g_wb_on, v); MLOG("[flag] writeback = %d", v); return; }
+    if (!strcmp(name, "wb_fence_small")) { (void)wb_fence_small_on(); atomic_store(&g_wb_fence_small, v != 0); MLOG("[flag] wb_fence_small = %d", v != 0); return; }
+    if (!strcmp(name, "wb_sig")) { (void)wb_sig_note(NULL); atomic_store(&g_wb_sig, v != 0); MLOG("[flag] wb_sig = %d", v != 0); return; }
     if (!strcmp(name, "deferred")) { extern void nvn_set_deferred_binds(int on); nvn_set_deferred_binds(v); return; }
     if (!strcmp(name, "framewait")) { extern void nvn_set_framewait(int on); nvn_set_framewait(v); return; }
     if (!strcmp(name, "uncapped_interval")) { extern void nvn_set_uncapped_interval(int on); nvn_set_uncapped_interval(v); return; }
@@ -2724,10 +2737,61 @@ static void wb_snap(wb_ent *e) {
     uint32_t n = (uint32_t)e->t.L.size; if (e->snap_n != n) { free(e->snap); e->snap = malloc(n); e->snap_n = e->snap ? n : 0; }
     if (e->snap) memcpy(e->snap, e->t.mem, n);
 }
+/* TOTK diagnostic: TOTK_WATCH_TEX=WxHx<fmt> / TOTK_WATCH_SER=<serial> + TOTK_WATCH_READ=1 arms the CPU watch (see
+   runtime/gfx_bridge.c) on the pool memory of that render target the first time the GPU renders into it, so a CPU access
+   to the rendering is logged with pc / lr (who reads what the GPU wrote). */
+static _Atomic int g_diag_watch_armed;
+static _Atomic uint64_t g_diag_watch_ser;
+static void diag_watch_target(const tex_t *t) {
+    static int inited, on, follow; static unsigned w, h; static unsigned long long fmt; static uint64_t ser;
+    if (!inited) {
+        inited = 1;
+        const char *e = getenv("TOTK_WATCH_TEX"); if (e) on = sscanf(e, "%ux%ux%llx", &w, &h, &fmt) == 3;
+        const char *s = getenv("TOTK_WATCH_SER"); if (s) { on = 1; ser = strtoull(s, NULL, 0); }
+        follow = getenv("TOTK_WATCH_FOLLOW") != NULL;   /* re-arm on every new matching target (serials differ per session) */
+    }
+    if (!on || !t->mem || !t->L.size) return;
+    if (ser ? t->serial != ser : (t->d.width != w || t->d.height != h || (unsigned long long)t->d.format != fmt)) return;
+    if (atomic_load(&g_diag_watch_armed) && !(follow && t->serial != atomic_load(&g_diag_watch_ser))) return;
+    atomic_store(&g_diag_watch_ser, t->serial);
+    atomic_store(&g_diag_watch_armed, 1);
+    extern void runtime_watch_set(uintptr_t addr, size_t len);
+    extern void runtime_watch_tag(uint64_t ser);
+    runtime_watch_tag(t->serial);
+    MLOG("[watch] arming on F%llu render target ser=%llu %ux%u fmt=%#x mem=%p size=%llu", (unsigned long long)atomic_load(&g_cur_frame),
+         (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, (void *)t->mem, (unsigned long long)t->L.size);
+    runtime_watch_set((uintptr_t)t->mem, t->L.size);
+}
+/* TOTK diagnostic: TOTK_WATCH_STAMP=<fragment shader key prefix> arms the CPU read watch (runtime/gfx_bridge.c) on the
+   render target of that draw: the grass cut map's stamp pass. A later guest read of the mask's pool bytes then shows up
+   with pc / lr, which says whether the game reads the rendering back and from where. */
+static _Atomic uint64_t g_diag_stamp_armed;
+static void diag_stamp_watch(const tex_t *t, const char *fs) {
+    static int inited, on; static char pre[17]; static size_t plen;
+    if (!inited) {
+        inited = 1;
+        const char *e = getenv("TOTK_WATCH_STAMP");
+        if (e && *e) { on = 1; plen = strlen(e); if (plen > 16) plen = 16; memcpy(pre, e, plen); }
+    }
+    if (!on || !t || !t->mem || !t->L.size || !fs || strncmp(fs, pre, plen)) return;
+    if (atomic_load(&g_diag_stamp_armed) == t->serial) return;
+    atomic_store(&g_diag_stamp_armed, t->serial);
+    extern void runtime_watch_set(uintptr_t addr, size_t len);
+    extern void runtime_watch_tag(uint64_t ser);
+    runtime_watch_tag(t->serial);
+    MLOG("[watch] stamp draw F%llu fs=%s: arming on ser=%llu %ux%u fmt=%#x mem=%p size=%llu", (unsigned long long)atomic_load(&g_cur_frame),
+         fs, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, (void *)t->mem, (unsigned long long)t->L.size);
+    runtime_watch_set((uintptr_t)t->mem, t->L.size);
+}
 static void wb_note(const tex_t *t) {
     TILELOG(t, "GPU render (owned %d)", gpu_owned(t->serial));
+    diag_watch_target(t);
     if (!atomic_load(&g_wb_on) || !t->mem || !t->L.size) return;
     id o = serial_get(t->serial); if (!o) return;
+#ifndef GAME_BOTW
+    void totk_mask_note(const tex_t *t, id o);
+    totk_mask_note(t, o);   // the grass masks are read back on the CPU without an invalidate (end of this file)
+#endif
     BOTW_TINY_NOTE(t, o)
     /* CPU writes after this rendering show up in nvn_dirty_since. TOTK (#90): the stamp comes first; a write that faults while
        the pages are being protected then counts as after it (taken after, it covered that page, writable from then on). */
@@ -2794,6 +2858,7 @@ static void wb_back_batch(wb_ent **ents, id<MTLTexture> __strong *mts, int n, si
             at += (lp * lr + 255) & ~(size_t)255;
         }
         nvn_dirty_gpu_write_end(tok);
+        wb_sig_note(t);
         if (ok) { uint64_t d = ++g_wb_done; if (d <= 8 || d % 500 == 0) MLOG("[writeback] ser=%llu %ux%u nvnfmt=%#x lv%u：GPU 渲染结果写回内存（累计 %llu 张 / %llu MB，CPU 已改写而跳过 %llu 张）", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (unsigned long long)d, (unsigned long long)(g_wb_bytes >> 20), (unsigned long long)g_wb_skip_cpu); }
         else MLOG("【红】GPU 写回内存失败 ser=%llu 格式 %#x", (unsigned long long)t->serial, t->d.format);
         wb_ent_free(e);
@@ -2812,10 +2877,11 @@ void mtl_wb_eager(void) {
     for (uint32_t i = 0; i < g_wb.cap && nl < 512 && g_wb.n; i++) {
         wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL;
         if (!e || e->t.d.width != w || e->t.d.height != h) continue;
+        if (e->fence > g_fence) continue;   /* noted for a submission that is not committed yet: waiting would hang */
         uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;
     }
     pthread_mutex_unlock(&g_smu);
-    wb_write_list(list, nl, 1);
+    wb_write_list(list, nl, 0);
 }
 void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     if (!p || !p->mem || !atomic_load(&g_wb_on)) return;
@@ -2826,6 +2892,56 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     for (uint32_t i = 0; i < g_wb.cap && nl < 512; i++) {
         wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL;
         if (!e || e->t.mem >= z || e->t.mem + e->t.L.size <= a) continue;
+        uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;   // deletion shifts entries: rescan
+    }
+    pthread_mutex_unlock(&g_smu);
+    wb_write_list(list, nl, 0);
+}
+/* TOTK: the cut reaction of grass is decided from a 128x128 RGBA8 target that the grass pass renders every frame into a
+   pool the CPU reads without an invalidate, flush or copy. On hardware the bytes are in the pool once the frame's fence
+   has passed; here they stayed in the Metal texture, and every swing was decided from the zeros the pool held (no blades,
+   no insects, grass not cut -- upstream issue #49). Render targets up to 64 KiB whose rendering has completed are written
+   back after the game's fence waits (nvnSyncWait / nvnQueueFinish); wb_write_list_ still keeps newer CPU writes.
+   TOTK_WB_FENCE_SMALL=0 restores the invalidate-only behaviour. */
+enum { WB_FENCE_SMALL_MAX = 64 * 1024 };
+static int wb_fence_small_on(void) {
+    int v = atomic_load(&g_wb_fence_small);
+    if (v < 0) { const char *e = getenv("TOTK_WB_FENCE_SMALL"); v = !(e && !strcmp(e, "0")); atomic_store(&g_wb_fence_small, v); }
+    return v;
+}
+/* TOTK_WB_SIG=1: after a small target is written back, log how its pool bytes look (texels that are not 0xffffffff),
+   at most 4 lines a second per target (a 16x16 target written back every frame used to take every slot). TOTK_WB_SIG=2
+   logs only the exact 64 KiB targets (the grass cut map). The map is white except where the sword struck: the count
+   rising after a swing says the CPU now receives those marks (it read a constant picture before). */
+static void wb_sig_note(const tex_t *t) {
+    int on = atomic_load(&g_wb_sig);
+    if (on < 0) { const char *e = getenv("TOTK_WB_SIG"); on = e ? atoi(e) : 0; if (e && on == 0) on = 1; atomic_store(&g_wb_sig, on); }
+    if (!on || !t || !t->mem || t->L.size > WB_FENCE_SMALL_MAX) return;
+    if (on >= 2 && t->L.size != WB_FENCE_SMALL_MAX) return;
+    static struct { uint64_t ser, since; uint32_t nw; } slots[32];
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int i = -1;
+    for (int k = 0; k < 32; k++) { if (slots[k].ser == t->serial) { i = k; break; } if (i < 0 && !slots[k].ser) i = k; }
+    if (i < 0) i = 0;
+    if (slots[i].ser && now - slots[i].since < 250000000ull) return;
+    uint32_t was = slots[i].nw; int had = slots[i].ser != 0;
+    slots[i].ser = t->serial; slots[i].since = now;
+    const uint32_t *p = (const uint32_t *)t->mem; size_t n = (size_t)t->L.size / 4; uint32_t nw = 0;
+    for (size_t k = 0; k < n; k++) nw += p[k] != 0xffffffffu;
+    slots[i].nw = nw;
+    if (had && nw != was) MLOG("[writeback] sig F%llu ser=%llu %ux%u nvnfmt=%#x nonwhite=%u (was %u)", (unsigned long long)atomic_load(&g_cur_frame),
+                               (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, nw, was);
+    else MLOG("[writeback] sig F%llu ser=%llu %ux%u nvnfmt=%#x nonwhite=%u", (unsigned long long)atomic_load(&g_cur_frame),
+              (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, nw);
+}
+void mtl_wb_fence_done(void) {
+    if (!atomic_load(&g_wb_on) || !wb_fence_small_on()) return;
+    uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);   // every fence at or below this has completed
+    pthread_mutex_lock(&g_smu);
+    wb_ent *list[512]; int nl = 0;
+    for (uint32_t i = 0; i < g_wb.cap && nl < 512; i++) {
+        wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL;
+        if (!e || e->t.L.size > WB_FENCE_SMALL_MAX || e->fence > done) continue;
         uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;   // deletion shifts entries: rescan
     }
     pthread_mutex_unlock(&g_smu);
@@ -2858,22 +2974,26 @@ static void wb_drop_all(void) {
 }
 static void wb_write_list(wb_ent **list, int nl, int force) {
     if (!nl) return;
-    static uint64_t calls, total_ns, max_ns, since;
+    static uint64_t calls, total_ns, wait_ns, stage_ns, max_ns, since;
+    uint64_t w0 = g_wb_ns_wait, s0 = g_wb_ns_stage;
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     wb_write_list_(list, nl, force);
-    uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), d = t1 - t0;
-    calls++; total_ns += d; if (d > max_ns) max_ns = d; if (!since) since = t0;
+    uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), d = t1 - t0, wd = g_wb_ns_wait - w0, sd = g_wb_ns_stage - s0;
+    calls++; total_ns += d; wait_ns += wd; stage_ns += sd; if (d > max_ns) max_ns = d; if (!since) since = t0;
     if (t1 - since > 5000000000ull) {
-        MLOG("[writeback] last %.1f s: %llu calls holding the game's thread %.2f ms in all (%.3f ms average, %.2f ms longest)", (t1 - since) / 1e9,
-             (unsigned long long)calls, total_ns / 1e6, total_ns / 1e6 / (double)calls, max_ns / 1e6);
-        calls = total_ns = max_ns = 0; since = t1;
+        MLOG("[writeback] last %.1f s: %llu calls holding the game's thread %.2f ms in all (%.3f ms average, %.2f ms longest; %.3f ms waiting for the GPU, %.3f ms swizzling staged copies, %.3f ms the rest)",
+             (t1 - since) / 1e9, (unsigned long long)calls, total_ns / 1e6, total_ns / 1e6 / (double)calls, max_ns / 1e6,
+             wait_ns / 1e6 / (double)calls, stage_ns / 1e6 / (double)calls, (total_ns - wait_ns - stage_ns) / 1e6 / (double)calls);
+        calls = total_ns = wait_ns = stage_ns = max_ns = 0; since = t1;
     }
 }
 /* Writes the listed renderings back to memory (the entries are freed); force: even over CPU writes since the render. */
 static void wb_write_list_(wb_ent **list, int nl, int force) {
     if (!nl) return;
     { extern void nvn_x_drain(void) __attribute__((weak)); if (nvn_x_drain) nvn_x_drain(); }   // translation thread: nothing queued overtakes this read-back (as for ReadTexels)
+    { uint64_t w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     WB_WAIT_GPU(list, nl)
+    g_wb_ns_wait += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0; }
     /* Freshness is decided for every entry before anything is written back (a write-back marks its pages written), and
        of several renderings of the same memory (texture objects over it) only the newest is written back. */
     int fresh[512];
@@ -2914,9 +3034,8 @@ static void wb_write_list_(wb_ent **list, int nl, int force) {
             wb_ent_free(e); continue;
         }
         if (!mt || bc_unpack(t->d.format, &upf, &ubpp) || t->d.target == 2 || t->d.samples > 1) { if (++g_wb_skip_fmt <= 8) MLOG("【红】GPU 写回内存：不支持的贴图 ser=%llu 格式 %#x 目标 %d", (unsigned long long)t->serial, t->d.format, t->d.target); wb_ent_free(e); continue; }
-        /* BOTW: the submission that rendered this texture may already hold a copy of it (botw_wb_stage_encode); that copy
-           is swizzled now. TOTK never stages (BOTW_WB_FROM_STAGE is empty and layers stays as it was). */
-#ifdef GAME_BOTW
+        /* the submission that rendered this texture may already hold a copy of it (botw_wb_stage_encode, small targets);
+           that copy is swizzled now */
         {
             unsigned layers = t->L.layers ? t->L.layers : 1, ok = 1;
             /* the GPU's bytes landing in memory: not a CPU write (with dm_guest_write_prepare the page this texture shares
@@ -2928,10 +3047,10 @@ static void wb_write_list_(wb_ent **list, int nl, int force) {
             if (!layers) {
                 if (ok) { uint64_t d = ++g_wb_done; if (d <= 8 || d % 500 == 0) MLOG("[writeback] ser=%llu %ux%u nvnfmt=%#x lv%u：GPU 渲染结果写回内存（累计 %llu 张 / %llu MB，CPU 已改写而跳过 %llu 张）", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (unsigned long long)d, (unsigned long long)(g_wb_bytes >> 20), (unsigned long long)g_wb_skip_cpu); }
                 else MLOG("【红】GPU 写回内存失败 ser=%llu 格式 %#x", (unsigned long long)t->serial, t->d.format);
+                wb_sig_note(t);
                 wb_ent_free(e); continue;
             }
         }
-#endif
         size_t bytes = wb_tex_bytes(t);
         if (nb && (!wb_batch_on() || nb == WB_BATCH_MAX || batch_bytes + bytes > WB_BATCH_BYTES)) { wb_back_batch(batch, batch_mt, nb, batch_bytes); nb = 0; batch_bytes = 0; }
         batch[nb] = e; batch_mt[nb++] = mt; batch_bytes += bytes;
@@ -12112,6 +12231,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         for (int r = 0; r < 4; r++) if (S.tex[1][r]) { int tid = (int)(S.tex[1][r] & 0xfffff); const treg_t *t = tid < g_ntreg && g_treg[tid].ok ? &g_treg[tid] : NULL;
             MLOG("[draw]   ps slot %d handle %#llx tid %d %s %ux%u fmt=%#x tgt=%d layout=%d mem=%p ser=%llu", r, (unsigned long long)S.tex[1][r], tid, t ? "ok" : "UNREGISTERED",
                  t ? t->t.d.width : 0, t ? t->t.d.height : 0, t ? t->t.d.format : 0, t ? t->t.d.target : 0, t ? t->t.has_layout : 0, t ? (void *)t->t.mem : NULL, t ? (unsigned long long)t->t.serial : 0ull); } } }
+    diag_stamp_watch(R.has_rt ? R.rt.color[0] : NULL, pr->sh[1] ? pr->sh[1]->key : NULL);
     if (S.color.logic_op != NVN_LOGIC_OP_COPY || (S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS))
         RED_ONCE(70, "TOTK: logic op %u / alpha test %u not implemented on Metal (drawn without it)", S.color.logic_op, S.color.alpha_func);
     if (S.render_disabled || S.raster_discard) { g_draw_skip[S.render_disabled ? 3 : 4]++; return; }   // TOTK: SetRenderEnable(false) / SetRasterizerDiscard(true)
@@ -12547,6 +12667,29 @@ static id<MTL4ComputeCommandEncoder> disp_enc(void) {
     if (g_disp_n % 20000 == 0) MLOG("[nvn] 计算派发 至 %llu 次：其中 %llu 次（%.0f%%）接在已开的计算编码器里，没有另开编码器", (unsigned long long)g_disp_n, (unsigned long long)g_disp_shared, 100.0 * (double)g_disp_shared / (double)g_disp_n);
     return g_blit;
 }
+/* TOTK: a compute kernel can write a CPU-pool texture through an image binding (the grass cut map is one). That write
+   would live only in the MTLTexture; the game reads the pool bytes back on the CPU to spawn the cut debris and the items
+   hidden in the grass. Note it the way a render pass does (wb_note), so the game's flush / invalidate writes it back. */
+static void img_write_note(NvShader *cs) {
+    for (int i = 0; cs && i < cs->rf.nb; i++) {
+        const nvn_rbind *b = &cs->rf.b[i];
+        if (b->kind != NVN_RB_IMG || !b->rw || b->reg >= 32 || !S.img[5][b->reg]) continue;
+        int tid = (int)(S.img[5][b->reg] & 0xfffff);
+        tex_t t;
+        registry_lock();
+        int ok = tid >= 0 && tid < g_ntreg && g_treg[tid].ok;
+        if (ok) t = g_treg[tid].t;
+        registry_unlock();
+        if (!ok || !t.mem || !t.L.size || !tex_mirrored(&t)) continue;
+        gpu_owned_mark(t.serial);
+        wb_note(&t);
+        static int n;
+        if (n++ < 24 || n % 3000 == 0)
+            MLOG("[imgwb] F%llu cs=%.8s image write ser=%llu %ux%u fmt=%#x mem=%p size=%llu (noted %d)",
+                 (unsigned long long)atomic_load(&g_cur_frame), cs->key, (unsigned long long)t.serial, t.d.width, t.d.height,
+                 t.d.format, (void *)t.mem, (unsigned long long)t.L.size, n);
+    }
+}
 static void dispatch(const p_dispatch *dp) {
     zskip_clear();
     if (!S.prog) { RED_ONCE(27, "派发前没有绑定程序"); return; }
@@ -12597,6 +12740,7 @@ static void dispatch(const p_dispatch *dp) {
     enc_c_pso(ce, ps);
     g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z;
     encode_args(ce, cs, 5, 0);
+    img_write_note(cs);
     if (atomic_load(&g_draw_log) > 0) MLOG("[uw] F%llu pass %llu dispatch cs %.8s grid %dx%dx%d", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, cs->key, dp->x, dp->y, dp->z);
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
     if (!reuse) enc_c_end(ce);
@@ -12820,6 +12964,52 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
                 toTexture:mt destinationSlice:is3d ? 0 : layer0 + r->zoffset + z destinationLevel:level destinationOrigin:MTLOriginMake(r->xoffset, r->yoffset, is3d ? r->zoffset + z : 0)];
     enc_b_end(b); cb_commit(cb); cb_wait(cb);
     if (!nogpu() && cb.status != MTLCommandBufferStatusCompleted) die("WriteTexels: GPU upload failed");
+}
+/* TOTK: nvnTextureFlushTexels (the game asking for GPU-written texels to become visible in pool memory, which it then
+   reads on the CPU). Was a no-op, so the CPU read the pool's stale bytes: cutting grass still respawned nothing — no
+   debris, no item drops (the terrain shader reads the fresh Metal texture, so only the visual cut worked). On hardware
+   this call is cache maintenance for exactly that read; here the GPU rendering is copied back into the pool in NVN layout
+   (the same path as the write-back on invalidate, see wb_back_batch). TOTK_FLUSHTX=0 restores the no-op. */
+void mtl_flush_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r) {
+    static _Atomic int on = -1;
+    int v = atomic_load(&on);
+    if (v < 0) { const char *e = getenv("TOTK_FLUSHTX"); v = !(e && !strcmp(e, "0")); atomic_store(&on, v); }
+    if (!v || !t->mem || !t->L.size || !tex_mirrored(t)) return;
+    uint64_t kk = t->serial;
+    wb_ent *list[1]; int nl = 0;
+    pthread_mutex_lock(&g_smu);
+    wb_ent *e = nvn_hm_get(&g_wb, &kk);
+    int wb = e != NULL, own = totk_serial_has(&g_gpu_owned, kk);   // not gpu_owned(): that takes g_smu again
+    /* Log every flush that has a rendering behind it (the game reads what the GPU wrote); the CPU-only ones are noise. */
+    { static _Atomic int n; int seq = atomic_fetch_add(&n, 1);
+      if (wb || own || seq < 20 || seq % 500 == 0) {
+        uint64_t th = 0; pthread_threadid_np(NULL, &th);
+        extern _Atomic int dm_submit_busy;
+        MLOG("[flushtx] F%llu th=%llu sub=%d busy=%d gf=%llu gd=%llu ser=%llu %ux%u fmt=%#x lv=%u mem=%p owned=%d mirrored=%d wb=%d wf=%llu region=%d,%d %dx%d lv0=%u lay0=%u",
+             (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)th, on_sub_thread(), atomic_load(&dm_submit_busy),
+             (unsigned long long)g_fence, (unsigned long long)g_done, (unsigned long long)kk, t->d.width, t->d.height, t->d.format, t->d.levels,
+             (void *)t->mem, own, tex_mirrored(t), wb, (unsigned long long)(e ? e->fence : 0),
+             r ? r->xoffset : -1, r ? r->yoffset : -1, r ? r->width : -1, r ? r->height : -1, level, layer0);
+      } }
+    /* The rendering is behind a write-back record: write it back now (the entry is consumed, the later invalidate has nothing
+       left to do). A record whose submission has not been committed yet cannot be written back yet; it is kept for the
+       invalidate (the flush on the recording thread must not wait for a fence that is not in the queue). */
+    if (e) {
+        if (e->fence > g_fence) { pthread_mutex_unlock(&g_smu); return; }
+        nvn_hm_del(&g_wb, &kk); list[nl++] = e;
+    } else if (own) {   // rendered, but no record (already written back once): copy the texture back
+        id o = hm_get_id(&g_by_serial, &kk);
+        if (o) { wb_ent *c = calloc(1, sizeof *c); if (c) { c->t = *t; c->obj = (void *)CFBridgingRetain(o); list[nl++] = c; } }
+    }
+    pthread_mutex_unlock(&g_smu);
+    if (!nl) return;
+    wb_write_list(list, nl, 1);
+    if (t->L.size <= (1u << 20)) {
+        const uint8_t *b = t->mem; size_t nz = 0;
+        for (size_t i = 0; i < t->L.size; i++) nz += b[i] != 0;
+        static _Atomic int n2; int q = atomic_fetch_add(&n2, 1);
+        if (q < 200) MLOG("[flushtx] wrote back ser=%llu %ux%u: %zu/%zu bytes non-zero in the pool", (unsigned long long)kk, t->d.width, t->d.height, nz, (size_t)t->L.size);
+    }
 }
 static void copy_b2t(const p_copy_b2t *c) {
     if (c->tex) zskip_del(c->tex->serial);
@@ -16717,10 +16907,17 @@ void botw_tiny_commit(void) {   // in mtl_sub_commit, after the last render pass
             free(e->snap); }
         free(l); }];
 }
+#endif
 /* Write-back staging (BOTW_WB_* in nvn_obj.h; docs/botw-v1.9.0-port.md). Serials rendered in this submission are noted on the submit
    thread; at the submission's end each small one (WB_STAGE_MAX) is copied into its stage buffer in the same command
-   buffer, so the invalidate waits for that fence only and swizzles from the stage without a read-back blit. */
+   buffer, so the invalidate waits for that fence only and swizzles from the stage without a read-back blit.
+   TOTK: the grass cut map is read by the CPU at nvnSyncWait every frame; the fence write-back takes its stage copy the
+   same way, which removes the per-frame blit-and-wait from the game's thread. */
+#ifdef GAME_BOTW
 #define WB_STAGE_MAX (256u << 10)   /* larger textures keep the read-back blit at the invalidate */
+#else
+#define WB_STAGE_MAX (64u << 10)    /* TOTK: exactly the targets the fence write-back flushes (WB_FENCE_SMALL_MAX) */
+#endif
 static uint64_t g_wb_sub[64]; static int g_wb_nsub;   /* submit thread: serials noted in this submission */
 static uint64_t g_wb_staged, g_wb_from_stage;
 void botw_wb_sub_note(uint64_t k) {
@@ -16781,6 +16978,7 @@ void botw_wb_stage_encode(void) {
 int botw_wb_from_stage(void *ev) {
     wb_ent *e = ev; const tex_t *t = &e->t;
     if (!e->stage || e->stage_fence < e->fence) return -1;
+    uint64_t s0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     /* ARC retains and autoreleases the receiver of -contents (NS_RETURNS_INNER_POINTER), and the game's thread has no
        autorelease pool to drain it (the write-back): without this pool no stage buffer was ever freed (2.9 GB of GPU
        memory in 25 minutes). */
@@ -16792,10 +16990,73 @@ int botw_wb_from_stage(void *ev) {
         ok = !nvn_swizzle(&t->d, l, y, src + off, lp, t->mem); off += n; g_wb_bytes += n;
     }
     if (++g_wb_from_stage == 1 || g_wb_from_stage % 5000 == 0) MLOG("[writeback] %llu written back from the submission's own copy (%llu copies staged)", (unsigned long long)g_wb_from_stage, (unsigned long long)g_wb_staged);
+    g_wb_ns_stage += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - s0;
     return ok;
 }
-#endif
 
+#ifndef GAME_BOTW
+/* TOTK grass-mask read-back. The grass interaction maps (a 256x256 and a 512x512 RGBA8 target, updated by the GPU every
+   frame and stamped where the sword cuts) are read back by the CPU, but nothing in the game calls ReadTexels or
+   FlushTexels for them and no invalidate ever covers them: the pool bytes the CPU reads kept whatever they last held, so
+   the cut made a hole in the grass yet the game spawned no debris and no item drops. Each mask rendered in a submission is
+   copied into a shared buffer at its end and swizzled into the pool when that submission completes — the same pattern as
+   the BotW water colours (botw_tiny_note), which are read without an invalidate too. */
+#define TMASK_MAX 8
+typedef struct { tex_t t; id<MTLTexture> __strong tex; uint8_t *snap; size_t lp, lr, off; } tmask_ent;
+static tmask_ent g_tmask[TMASK_MAX]; static int g_ntmask; static uint64_t g_tmask_done;
+static int tmask_on(void) {
+    static int v = -1;
+    /* Off by default: the submission-completion write-back did not bring the cut debris back, and the invalidate path
+       (now including compute image writes) is the one the game uses. TOTK_MASK_WB=1 turns it on again. */
+    if (v < 0) { const char *e = getenv("TOTK_MASK_WB"); v = e && !strcmp(e, "1"); if (v) MLOG("TOTK_MASK_WB: the grass masks are copied into memory when the submission that rendered them completes"); }
+    return v;
+}
+void totk_mask_note(const tex_t *t, id o) {
+    if (!tmask_on() || !t->mem || !t->L.size || t->d.levels != 1 || t->d.samples > 1 || t->d.target == 2 || t->L.layers > 1) return;
+    if (t->d.format != NVN_FORMAT_RGBA8) return;
+    unsigned w = t->d.width, h = t->d.height;
+    if (!((w == 256 && h == 256) || (w == 512 && h == 512))) return;
+    if (t->L.size != (uint64_t)w * h * 4) return;
+    id<MTLTexture> mt = [o isKindOfClass:[NvPkg class]] ? ((NvPkg *)o)->tex : o; if (!mt) return;
+    int i = 0; while (i < g_ntmask && g_tmask[i].t.serial != t->serial) i++;
+    if (i == g_ntmask) { if (g_ntmask == TMASK_MAX) return; g_ntmask++; }
+    else free(g_tmask[i].snap);
+    g_tmask[i] = (tmask_ent){*t, mt, malloc(t->L.size), (size_t)w * 4, h};
+    if (g_tmask[i].snap) memcpy(g_tmask[i].snap, t->mem, t->L.size);
+}
+void totk_mask_commit(void) {
+    if (!g_ntmask) return;
+    size_t off[TMASK_MAX], total = 0;
+    for (int i = 0; i < g_ntmask; i++) { size_t n = g_tmask[i].lp * g_tmask[i].lr; off[i] = total; g_tmask[i].off = total; total += (n + 255) & ~(size_t)255; }
+    id<MTLBuffer> buf = [g_dev newBufferWithLength:total options:MTLResourceStorageModeShared];
+    if (!buf) { for (int i = 0; i < g_ntmask; i++) { free(g_tmask[i].snap); g_tmask[i].tex = nil; } g_ntmask = 0; return; }
+    res_add(buf); res_commit();
+    for (int i = 0; i < g_ntmask; i++) {
+        tmask_ent *e = &g_tmask[i];
+        enc_b_copy_texture_buffer(blit(), e->tex, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(e->t.d.width, e->t.d.height, 1), buf, off[i], e->lp, e->lp * e->lr);
+        e->tex = nil;
+    }
+    int n = g_ntmask; tmask_ent *l = malloc(n * sizeof *l); if (!l) MDIE("grass-mask write-back list");
+    memcpy(l, g_tmask, n * sizeof *l); g_ntmask = 0;
+    [g_commit_blocks addObject:^{
+        @autoreleasepool {
+            for (int i = 0; i < n; i++) { tmask_ent *e = &l[i]; const tex_t *t = &e->t;
+                int ok = 0;
+                if (e->snap && !memcmp(e->snap, t->mem, t->L.size)) {   // the CPU has not written these bytes since the rendering
+                    void *tok = nvn_dirty_tracked(t->mem, t->L.size) ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
+                    if (!tok) dm_guest_write_prepare(t->mem, t->L.size);
+                    ok = !nvn_swizzle(&t->d, 0, 0, (const uint8_t *)buf.contents + e->off, e->lp, t->mem);
+                    nvn_dirty_gpu_write_end(tok);
+                }
+                uint64_t d = ++g_tmask_done;
+                if (d <= 8 || d % 3000 == 0) MLOG("[maskwb] %s ser=%llu %ux%u (done %llu)", ok ? "wrote" : "skipped/failed", (unsigned long long)t->serial, t->d.width, t->d.height, (unsigned long long)d);
+                free(e->snap);
+            }
+            free(l);
+        }
+    }];
+}
+#endif
 #include "nvn_sampler_border_probe.h"
 #include "nvn_texels_region_probe.h"
 #include "nvn_writeback_probe.h"

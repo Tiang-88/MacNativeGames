@@ -45,8 +45,11 @@ NVN(nvnDeviceGetTimestampInNanoseconds, uint64_t, const NVNdevice *d, const NVNc
 NVN(nvnMemoryPoolGetSize, size_t, const NVNmemoryPool *p) { return (size_t)((const pool_t *)p)->size; }
 // The CPU is about to read what the GPU wrote: GPU renderings into this pool's textures are written back (nvn_mtl.m).
 void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n);
-NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { if (off >= 0) mtl_pool_invalidate((const pool_t *)p, (uint64_t)off, n); }
-NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *b, ptrdiff_t off, size_t n) { (void)b; (void)off; (void)n; }
+NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
+    if (off < 0) return;
+    { static int q; if (q < 3000 && n >= 4096) { q++; LOG("[poolinv] mem=%p off=%lld n=%zu", (void *)((const pool_t *)p)->mem, (long long)off, n); } }
+    mtl_pool_invalidate((const pool_t *)p, (uint64_t)off, n);
+}
 
 // ---------- Texture builder and texture queries ----------
 #define CTB(b) ((const tex_builder_t *)(b))

@@ -144,6 +144,7 @@ void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
 static uint64_t fence_now(int *token);
 static int fence_wait(uint64_t k, uint64_t timeout_ns);
 static void x_drain(void);
+void mtl_wb_fence_done(void);   // TOTK: small render targets read from the CPU without an invalidate (grass cut map, nvn_mtl.m)
 static int async_replay(void);
 static int call_stats_on(void);
 static void call_stats_end(const void *cb, const uint8_t *copy);
@@ -267,7 +268,9 @@ NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
    does nothing when the range has no pending rendering; ordinary shared-buffer CPU uploads remain coherent. */
 void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n);
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
-    if (off >= 0 && n) mtl_pool_invalidate((const pool_t *)p, (uint64_t)off, n);
+    if (off < 0 || !n) return;
+    { static int q; if (q < 3000 && n >= 4096) { q++; LOG("[poolflush] mem=%p off=%lld n=%zu", (void *)((const pool_t *)p)->mem, (long long)off, n); } }
+    mtl_pool_invalidate((const pool_t *)p, (uint64_t)off, n);
 }
 NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool *p){return (NVNmemoryPoolFlags)((const pool_t *)p)->flags;}
 NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p){const pool_t *v=(const void *)p;
@@ -308,6 +311,14 @@ NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *b){return (void *)
 NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *b){return ((const totk_buffer *)b)->off;}
 NVN(nvnBufferGetSize, size_t, const NVNbuffer *b){return ((const totk_buffer *)b)->size;}
 NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *b,ptrdiff_t off,size_t size){const totk_buffer *v=(const void *)b;if(off<0||(uint64_t)off>v->size||size>v->size-(uint64_t)off)die("invalid NVN buffer flush range");dm_guest_write_prepare((uint8_t *)h_nvnBufferMap(b)+off,size);}
+/* TOTK: a buffer over a CPU-pool range that the GPU wrote (the grass cut map is copied out this way) must be written
+   back before the CPU reads it; forward the invalidate to the pool path, which knows the renderings over that memory. */
+NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *b, ptrdiff_t off, size_t size) {
+    const totk_buffer *v = (const void *)b;
+    if (!v->pool || v->pool->magic != MAGIC('P','O','O','L') || off < 0 || (uint64_t)off > v->size || size > v->size - (uint64_t)off) return;
+    { static int q; if (q < 100) { q++; LOG("[bufinv] mem=%p off=%lld n=%zu", (void *)v->pool->mem, (long long)(v->off + (int64_t)off), size); } }
+    mtl_pool_invalidate(v->pool, (uint64_t)(v->off + (int64_t)off), size);
+}
 
 // ---------- 描述符池 ----------
 // ---------- Descriptor pools ----------
@@ -566,6 +577,7 @@ static void read_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r,
     if (!row) row = wb;
     if (!img) img = row * hb;
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
+    { static int n; if (n < 1000) { n++; if (o->d.width >= 128 || r->width >= 128) LOG("[readtx] ser=%llu %ux%u fmt=%#x region=%d,%d %dx%d lv=%u lay=%u mem=%p", (unsigned long long)o->serial, o->d.width, o->d.height, o->d.format, r->xoffset, r->yoffset, r->width, r->height, level, layer0, (void *)o->mem); } }
     x_drain(); mtl_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img);
 }
 NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst) {
@@ -590,8 +602,25 @@ NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, c
 NVN(nvnTextureWriteTexelsStrided, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src, ptrdiff_t row, ptrdiff_t img) {
     write_texels(CTX(t), (const view_t *)v, r, src, row, img);
 }
-NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }
-NVN(nvnTextureInvalidateTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }
+// TOTK: FlushTexels means "the GPU wrote these texels; make them visible to the CPU". The CPU reads them out of the pool
+// memory (grass cut map: debris / item drops), which holds stale zeros unless the rendering is copied back (mtl_flush_texels).
+NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) {
+    const tex_t *o = CTX(t); const view_t *w = (const view_t *)v;
+    if (!o || !r) return;
+    unsigned level = w && w->set_levels ? (unsigned)w->base_level : 0, layer0 = w && w->set_layers ? (unsigned)w->min_layer : 0;
+    { static int n; if (n < 2000) { n++; LOG("[flushtx-api] ser=%llu %ux%u fmt=%#x region=%d,%d %dx%d lv=%u lay=%u mem=%p", (unsigned long long)o->serial, o->d.width, o->d.height, o->d.format, r->xoffset, r->yoffset, r->width, r->height, level, layer0, (void *)o->mem); } }
+    x_drain(); mtl_flush_texels(o, level, layer0, r);
+}
+/* TOTK: InvalidateTexels is the GPU -> CPU direction of the same cache maintenance (the CPU is about to read texels the
+   GPU wrote). It was a no-op, so a texture read through nvnTextureReadTexels or the pool bytes showed the pre-render
+   contents. Make it write the rendering back exactly as FlushTexels does. */
+NVN(nvnTextureInvalidateTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) {
+    const tex_t *o = CTX(t); const view_t *w = (const view_t *)v;
+    if (!o || !r) return;
+    unsigned level = w && w->set_levels ? (unsigned)w->base_level : 0, layer0 = w && w->set_layers ? (unsigned)w->min_layer : 0;
+    { static int n; if (n < 2000) { n++; LOG("[invaltx-api] ser=%llu %ux%u fmt=%#x region=%d,%d %dx%d lv=%u lay=%u mem=%p", (unsigned long long)o->serial, o->d.width, o->d.height, o->d.format, r->xoffset, r->yoffset, r->width, r->height, level, layer0, (void *)o->mem); } }
+    x_drain(); mtl_flush_texels(o, level, layer0, r);
+}
 
 // ---------- 采样器 ----------
 // ---------- Samplers ----------
@@ -723,14 +752,14 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     int k = (o->fenced & 2) != 0, lg = synclog_env();
     if (lg) { atomic_fetch_add(&g_sw_calls[k], 1); if (o->fence == mtl_last_fence()) atomic_fetch_add(&g_sw_newest[k], 1); }
     int tok = (o->fenced & 4) != 0;
-    if (tok ? fence_wait(o->fence, 0) : mtl_wait(o->fence, 0)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
+    if (tok ? fence_wait(o->fence, 0) : mtl_wait(o->fence, 0)) { survey_after_wait(s); mtl_wb_fence_done(); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
     if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
     int ok = tok ? fence_wait(o->fence, timeout) : mtl_wait(o->fence, timeout);
     totk_tl(TL_WAIT_OUT, o->fence, ok);
     if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], now_ns() - t0); }
-    if (ok) survey_after_wait(s);
+    if (ok) { survey_after_wait(s); mtl_wb_fence_done(); }
     return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
@@ -774,7 +803,7 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { NVN_BLOCKING(); (void)q; totk_tl(TL_FINISH_IN, 0, 0); x_drain(); mtl_finish(); totk_tl(TL_FINISH_OUT, 0, 0); }
+NVN(nvnQueueFinish, void, NVNqueue *q) { NVN_BLOCKING(); (void)q; totk_tl(TL_FINISH_IN, 0, 0); x_drain(); mtl_finish(); mtl_wb_fence_done(); totk_tl(TL_FINISH_OUT, 0, 0); }
 
 // ---------- 命令缓冲：录进游戏的命令内存，提交时执行 CPU 可见副作用 ----------
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
@@ -2258,8 +2287,9 @@ static int async_replay(void) {
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap);
 static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame);
+static __thread int t_x_thread;
 static void *x_thread(void *unused) {
-    (void)unused; pthread_setname_np("totk-translate");
+    (void)unused; pthread_setname_np("totk-translate"); t_x_thread = 1;
     for (;;) {
         pthread_mutex_lock(&g_xq_mu);
         while (g_xq_done == g_xq_in) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
@@ -2307,7 +2337,7 @@ static void x_wait_job(uint64_t job) {
     pthread_mutex_lock(&g_xq_mu); while (g_xq_done < job) pthread_cond_wait(&g_xq_cv, &g_xq_mu); pthread_mutex_unlock(&g_xq_mu);
 }
 static void x_drain(void) {   // everything queued so far has run (no-op when synchronous or idle)
-    if (!async_replay()) return;
+    if (!async_replay() || t_x_thread) return;   // on the translate thread the job being run is this very call: it would wait for itself
     NVN_BLOCKING();   // a guest thread gives its virtual core back while it waits (TOTK has three)
     pthread_mutex_lock(&g_xq_mu); uint64_t want = g_xq_in, have = g_xq_done; pthread_mutex_unlock(&g_xq_mu);
     if (have >= want) return;
