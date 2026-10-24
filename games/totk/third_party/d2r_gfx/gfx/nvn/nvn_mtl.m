@@ -2376,7 +2376,10 @@ static void pkg_owned_locked(uint64_t k) {
 typedef struct { tex_t t; uint64_t stamp; void *obj; uint8_t *snap; uint32_t snap_n; BOTW_WB_ENT_FIELDS } wb_ent;   // snap: the texture's own bytes when the rendering was noted (small targets only)
 static nvn_hmap g_wb = {.klen = 8};   // serial -> wb_ent * (g_smu): rendered since the last write-back
 static _Atomic int g_wb_on = 1;
+static _Atomic int g_wb_fence_small = -1;   // -1: from TOTK_WB_FENCE_SMALL; "flag wb_fence_small 0|1" switches it while the game runs
+static int wb_fence_small_on(void);
 static void wb_drop_all(void);
+static void wb_write_list(wb_ent **list, int nl, int force);
 /* TOTK: fill the driver segment c0 for vertex and compute shaders (thread-group counts, uniform / storage address tables,
    point size limit; see drv_scan). TOTK_DRV_FILL=0 or "flag drvfill 0" gives them the old all-zero segment (A/B only). */
 static _Atomic int g_drvfill_on = -1;
@@ -2466,6 +2469,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "drv_cache")) { driver_cache_set(v); return; }
     if (!strcmp(name, "drv_cache_check")) { driver_cache_check_set(v); return; }
     if (!strcmp(name, "writeback")) { if (!v) wb_drop_all(); atomic_store(&g_wb_on, v); MLOG("[flag] writeback = %d", v); return; }
+    if (!strcmp(name, "wb_fence_small")) { (void)wb_fence_small_on(); atomic_store(&g_wb_fence_small, v != 0); MLOG("[flag] wb_fence_small = %d", v != 0); return; }
     if (!strcmp(name, "deferred")) { extern void nvn_set_deferred_binds(int on); nvn_set_deferred_binds(v); return; }
     if (!strcmp(name, "framewait")) { extern void nvn_set_framewait(int on); nvn_set_framewait(v); return; }
     if (!strcmp(name, "uncapped_interval")) { extern void nvn_set_uncapped_interval(int on); nvn_set_uncapped_interval(v); return; }
@@ -2495,6 +2499,7 @@ static void wb_ent_free(wb_ent *e) { if (!e) return; if (e->obj) { defer_obj_rel
 enum { WB_SNAP_MAX = 256 * 1024 };
 static int wb_exact_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_WB_EXACT"); v = !(e && !strcmp(e, "0")); } return v; }
 static uint64_t g_wb_exact_rescued;
+int totk_wb_fence_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_WB_FENCE"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_WB_FENCE=0: write-backs wait for all submitted GPU work"); } return v; }
 static void wb_snap(wb_ent *e) {
     if (!wb_exact_on() || !e->t.mem || e->t.L.size > WB_SNAP_MAX) { free(e->snap); e->snap = NULL; e->snap_n = 0; return; }
     uint32_t n = (uint32_t)e->t.L.size; if (e->snap_n != n) { free(e->snap); e->snap = malloc(n); e->snap_n = e->snap ? n : 0; }
@@ -2591,6 +2596,31 @@ static void wb_drop_all(void) {
         uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); wb_ent_free(e); i = (uint32_t)-1;
     }
     pthread_mutex_unlock(&g_smu);
+}
+/* TOTK: the cut reaction of grass is decided from a 128x128 RGBA8 target that the grass pass renders every frame into a
+   pool the CPU reads without an invalidate, flush or copy. On hardware the bytes are in the pool once the frame's fence
+   has passed; here they stayed in the Metal texture, and every swing was decided from the zeros the pool held (no blades,
+   no insects, grass not cut -- upstream issue #49). Render targets up to 64 KiB whose rendering has completed are written
+   back after the game's fence waits (nvnSyncWait / nvnQueueFinish); wb_write_list still keeps newer CPU writes.
+   TOTK_WB_FENCE_SMALL=0 restores the invalidate-only behaviour. */
+enum { WB_FENCE_SMALL_MAX = 64 * 1024 };
+static int wb_fence_small_on(void) {
+    int v = atomic_load(&g_wb_fence_small);
+    if (v < 0) { const char *e = getenv("TOTK_WB_FENCE_SMALL"); v = !(e && !strcmp(e, "0")); atomic_store(&g_wb_fence_small, v); }
+    return v;
+}
+void mtl_wb_fence_done(void) {
+    if (!atomic_load(&g_wb_on) || !wb_fence_small_on()) return;
+    uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);   // every fence at or below this has completed
+    pthread_mutex_lock(&g_smu);
+    wb_ent *list[512]; int nl = 0;
+    for (uint32_t i = 0; i < g_wb.cap && nl < 512; i++) {
+        wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL;
+        if (!e || e->t.L.size > WB_FENCE_SMALL_MAX || e->fence > done) continue;
+        uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;   // deletion shifts entries: rescan
+    }
+    pthread_mutex_unlock(&g_smu);
+    wb_write_list(list, nl, 0);
 }
 /* Writes the listed renderings back to memory (the entries are freed); force: even over CPU writes since the render. */
 static void wb_write_list(wb_ent **list, int nl, int force) {
