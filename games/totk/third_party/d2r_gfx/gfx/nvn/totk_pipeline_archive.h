@@ -50,8 +50,12 @@ static int par_fill_light(void) {
     const char *e = getenv("TOTK_PIPELINE_ARCHIVE_FILL"); return e && !strcmp(e, "1");
 #endif
 }
+static int totk_math_mode(void);   // nvn_mtl.m: 0 safe, 1 relaxed, 2 fast (TOTK_MATH_MODE)
+/* Pipelines built from libraries compiled with another math mode live in a folder of their own: Metal would only miss on
+   the safe-math files (it checks the functions), but every miss would then overwrite a safe-math file with the other mode's. */
 static NSString *par_dir(void) {
-    NSString *name = @"pipelines"; int fast = totk_msl_fast_mask();   // nvn_mtl.m: TOTK_MSL_FAST 的分段（0 = 关）| TOTK_MSL_FAST parts (0 = off)
+    static const char *names[] = {"pipelines", "pipelines-relaxed", "pipelines-fast"};
+    NSString *name = @(names[totk_math_mode()]); int fast = totk_msl_fast_mask();   // nvn_mtl.m: TOTK_MSL_FAST 的分段（0 = 关）| TOTK_MSL_FAST parts (0 = off)
     if (fast) name = [name stringByAppendingFormat:@"-mslfast%d", fast];   // 改写源码编出的管线和 safe 的分开存 | pipelines built from rewritten source live apart
     if (totk_early_z_on()) name = [name stringByAppendingString:@"-ez"];   // 带 [[early_fragment_tests]] 的函数编出的管线（nvn_mtl.m TOTK_EARLY_Z）| pipelines built from shaders that now declare early fragment tests
     return [totk_rt_dir() stringByAppendingPathComponent:name];

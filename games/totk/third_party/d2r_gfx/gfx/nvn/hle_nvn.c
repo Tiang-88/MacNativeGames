@@ -849,6 +849,11 @@ static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) { op_hdr h = {op, si
 // TOTK: records are written into a growable host buffer per command buffer, never into game command memory.
 // Games hand the same command memory to several command buffers recording concurrently (budgeted for real NVN
 // encodings); our records are larger and would overwrite each other there. The game's memory is accounted only.
+#ifdef GAME_BOTW
+#define REC_PFX 40   /* == sizeof(copy_prefix), checked below */
+#else
+#define REC_PFX 32   /* == sizeof(copy_prefix), checked below */
+#endif
 static void cmd_reserve(cmd_t *o, size_t need) {
     if (o->seg && o->cur + need + OP_RESERVE <= o->end) return;
     size_t used = o->seg ? (size_t)(o->cur - o->seg) : 0;
@@ -942,7 +947,10 @@ static int reclog_limit(void) { static int v = -1; if (v < 0) { const char *e = 
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     if (o->recording) LOG("【红】BeginRecording 重入");
-    o->recording = 1; o->cur = o->seg;   /* the previous recording was copied at EndRecording */
+    o->recording = 1; o->cur = o->seg;   /* the previous recording was copied (or handed over) at EndRecording */
+    /* TOTK_REC_TAKE: room for the handle-copy prefix in front of the records, so EndRecording can hand a large recording
+       over as its copy without copying it (rec_take). Zeroed: the bytes are compared by the inline-bulk probe. */
+    cmd_reserve(o, REC_PFX); memset(o->cur, 0, REC_PFX); o->cur += REC_PFX;
 #ifdef GAME_BOTW
     cb_seen_set(o);
 #endif
@@ -990,6 +998,40 @@ typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uin
 #endif
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
+_Static_assert(sizeof(copy_prefix) == REC_PFX, "recording prefix");
+/* TOTK_REC_TAKE (port of DavidZande 5352ab7): a large recording is handed over as its own copy (the buffer becomes the
+   handle's storage and the command buffer gets a fresh one of the same size) instead of being copied: EndRecording's copy
+   was the largest memmove on the game's recording threads (source's profile: recording copy time -40-50% a frame). Only
+   when the recording fills at least half its buffer (little memory left unused) and is >= 8 KiB; small ones are still
+   copied into a buffer of their own size. Checks are the same as flatten_recording's. Returns NULL when it does not
+   apply. TOTK_REC_TAKE=0: always copy. */
+static uint64_t g_rec_taken, g_rec_taken_bytes;
+static int rec_take_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_REC_TAKE"); v = !(e && !strcmp(e, "0")); } return v; }
+static uint8_t *rec_take(cmd_t *o) {
+    size_t n = (size_t)(o->cur - o->seg), cap = (size_t)(o->end - o->seg);
+    if (!rec_take_on() || n < (8u << 10) || n * 2 < cap) return NULL;
+    const uint8_t *p = o->seg + REC_PFX, *e = o->cur; int bulk_ok = 1; uint32_t last_size = 0; size_t body = 0;
+    for (int first = 1;; first = 0) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.size < 8 || (h.size & 7) || p + h.size > e) die("corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
+        if (h.op == OP_JUMP) return NULL;   /* not produced any more (contiguous host buffer); the copy follows jumps */
+        if (h.op >= OP_COUNT_ || h.size > (64u << 20)) bulk_ok = 0;
+        if (first) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; }
+        else if (h.op == OP_BEGIN) bulk_ok = 0;
+        else if (h.op != OP_END) { last_size = h.size; body += h.size; }
+        if (h.op == OP_END) { if (h.size != 8 || p + 8 != e) bulk_ok = 0; break; }
+        p += h.size;
+    }
+    uint8_t *buf = o->seg, *fresh = malloc(cap); if (!fresh) die("command recording buffer allocation (%zu bytes)", cap);
+    o->seg = fresh; o->cur = fresh; o->end = fresh + cap;
+    copy_prefix *c = (copy_prefix *)buf; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
+#ifdef GAME_BOTW
+    c->used = 0;
+#endif
+    c->body_bytes = bulk_ok && body <= UINT32_MAX ? (uint32_t)body : 0; c->last_size = c->body_bytes ? last_size : 0;
+    g_copy_bytes += malloc_size(buf); g_rec_taken++; g_rec_taken_bytes += n;
+    return buf + REC_PFX;
+}
 /* TOTK_REPLAY_FAST (default 1; =0 the old paths): one switch shared by the replay's CPU fast paths (nvn_mtl.m reads the
    same variable). Here: the recording copy is sized by a first walk over the record headers and allocated once, instead
    of growing from 4 KiB by realloc and trimming at the end (the growth copies and the trim's move were ~500 samples per
@@ -1131,7 +1173,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     if (reclog_limit() && (int)t_rec_n < reclog_limit()) { char line[1024]; size_t n = 0; t_rec_n++;
         for (unsigned i = 1; i < OP_COUNT_ && n < sizeof line - 24; i++) if (t_rec_hist[i]) n += snprintf(line + n, sizeof line - n, " op%u×%u", i, t_rec_hist[i]);
         LOG("[rec] #%u cb=%p ours=%zu hw=%zu%s", t_rec_n, (void *)c, o->cmd_used - o->rec_start - 16, hw_before - o->hw_start, line); }
-    uint8_t *copy = flatten_recording(o->seg);
+    uint8_t *copy = rec_take(o); if (!copy) copy = flatten_recording(o->seg + REC_PFX);   /* TOTK_REC_TAKE: large recordings handed over */
     if (call_stats_on()) call_stats_end(c, copy);
     /* Finalizing the recorder does not retire its handle; only reusing the backing control region does. */
 #ifdef GAME_BOTW
@@ -1160,9 +1202,9 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
       if (b->n == b->cap) { b->cap = b->cap ? b->cap * 2 : 8; b->v = realloc(b->v, b->cap * sizeof *b->v); if (!b->v) die("command copy table"); }
       b->v[b->n++] = (cmd_copy){lo, hi, copy, 0, (uint32_t)token}; g_ncopies++; }
     { static uint64_t made; if (++made % 20000 == 0)
-        LOG("[cmd] recording copies: %llu made, %zu live, %.1f MiB, submit %llu; released %llu at a re-added control memory, %llu whose mark there was gone (%llu unmapped); index %zu buckets (%zu empty) of %zu, compacted %llu times",
+        LOG("[cmd] recording copies: %llu made, %zu live, %.1f MiB, submit %llu; released %llu at a re-added control memory, %llu whose mark there was gone (%llu unmapped); index %zu buckets (%zu empty) of %zu, compacted %llu times; handed over without copying %llu (%.1f MiB)",
             (unsigned long long)made, g_ncopies, g_copy_bytes / 1048576.0, (unsigned long long)g_submits, (unsigned long long)g_copy_drop_readd, (unsigned long long)g_copy_drop_token, (unsigned long long)g_copy_mark_faults,
-            g_cbk_used, g_cbk_empty, g_cbk_cap, (unsigned long long)g_cbk_compactions); }
+            g_cbk_used, g_cbk_empty, g_cbk_cap, (unsigned long long)g_cbk_compactions, (unsigned long long)g_rec_taken, g_rec_taken_bytes / 1048576.0); }
     pthread_mutex_unlock(&g_copy_mu);
     if (cmdlog_env()) LOG("[cmd] EndRecording cb=%p recorded=%p copy=%p ctl=%p", (void *)c, (void *)o->seg, (void *)copy, o->ctl);
     if (totk_life_on() && totk_life_cb_take(c)) { totk_life_log("end cb=%p handle=%p", (void *)c, (void *)copy); totk_life_handle_add((uint64_t)(uintptr_t)copy); }
@@ -1722,7 +1764,7 @@ void dm_nvn_probe_texture_pins(void) {
 void dm_nvn_probe_inline_bulk(void) {
     int saved = atomic_load(&g_inline_bulk_on); unsigned checks = 0;
     const unsigned lengths[] = {0, 1, 7, 3000};
-    size_t copies_before = g_ncopies; uint64_t bytes_before = g_copy_bytes;
+    size_t copies_before = g_ncopies; uint64_t bytes_before = g_copy_bytes, taken_before = g_rec_taken;
     for (unsigned scenario = 0; scenario < sizeof lengths / sizeof *lengths; scenario++) {
         NVNcommandBuffer cb[4]; uint8_t control[4][256] = {{0}}, commands[4096] = {0};
         pool_t pool = {.mem = commands};
@@ -1738,6 +1780,14 @@ void dm_nvn_probe_inline_bulk(void) {
             if (j % 7 == 0) h_nvnCommandBufferUpdateUniformBuffer(&cb[0], 0x1000, sizeof payload, 0, (j % 17 + 1) * 8, payload);
         }
         NVNcommandHandle source = h_nvnCommandBufferEndRecording(&cb[0]);
+        {   /* TOTK_REC_TAKE: the handle's bytes stay as they were when the same command buffer records again */
+            size_t sz = copy_of(source)->body_bytes + 16; uint8_t *keep = malloc(sz); memcpy(keep, (const void *)(uintptr_t)source, sz);
+            h_nvnCommandBufferBeginRecording(&cb[0]);
+            for (unsigned j = 0; j < 40; j++) h_nvnCommandBufferSetScissor(&cb[0], 500 + j, 1, 2, 3);
+            (void)h_nvnCommandBufferEndRecording(&cb[0]);
+            if (memcmp(keep, (const void *)(uintptr_t)source, sz)) die("inline bulk probe: a handle changed when its command buffer recorded again"); checks++;
+            free(keep);
+        }
         for (unsigned mode = 0; mode < 2; mode++) {
             atomic_store(&g_inline_bulk_on, mode);
             g_inline_bulk_negative = mode && scenario && getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 16;
@@ -1769,6 +1819,7 @@ void dm_nvn_probe_inline_bulk(void) {
         }
     }
     if (g_ncopies != copies_before || g_copy_bytes != bytes_before) die("inline bulk probe: copy leak"); checks++;
+    if (rec_take_on() && g_rec_taken == taken_before) die("inline bulk probe: no large recording was handed over (rec_take)"); checks++;
     g_inline_bulk_negative = 0; atomic_store(&g_inline_bulk_on, saved);
     LOG("inline bulk probe: %u byte/accounting/growth/nesting/lifetime checks passed", checks);
 }
@@ -1804,6 +1855,14 @@ NVN(nvnCommandBufferSetRenderEnableConditional, void, NVNcommandBuffer *c, NVNco
 }
 // Rasterizer discard runs vertex work without rasterising; with no transform feedback that is the same as not drawing.
 NVN(nvnCommandBufferSetRasterizerDiscard, void, NVNcommandBuffer *c, uint32_t e) { REC(c, OP_RASTER_DISCARD, p_flag)->value = B(e) != 0; }
+/* TOTK_DISCARD (default 1, 0 = ignored as before): DiscardColor / DiscardDepthStencil leave the bound target's contents
+   undefined. They are recorded, and the replay stores such an attachment DontCare when the pass draws nothing more
+   after the discard (nvn_mtl.m discard_op). The calls are counted either way (mtl_discard_calls, periodic log). */
+static _Atomic uint64_t g_discard_calls[2];
+void mtl_discard_calls(uint64_t v[2]) { v[0] = atomic_load(&g_discard_calls[0]); v[1] = atomic_load(&g_discard_calls[1]); }
+static int discard_rec_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_DISCARD"); v = !(e && !strcmp(e, "0")); } return v; }
+NVN(nvnCommandBufferDiscardColor, void, NVNcommandBuffer *c, int i) { atomic_fetch_add(&g_discard_calls[0], 1); if (discard_rec_on()) REC(c, OP_DISCARD_COLOR, p_flag)->value = i; }
+NVN(nvnCommandBufferDiscardDepthStencil, void, NVNcommandBuffer *c) { atomic_fetch_add(&g_discard_calls[1], 1); if (discard_rec_on()) REC(c, OP_DISCARD_DS, p_flag)->value = -1; }
 /* TOTK diagnostic: TOTK_BINDPROG_LOG=<frame_lo>-<frame_hi> prints every BindProgram of those frames with the program object, its
    vertex-stage shader data address and the guest call chain (module+offset), so a program choice can be traced to game code. */
 static uint64_t g_frame;
@@ -2328,7 +2387,7 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
         unsigned ops = 0, draws = 0, calls = 0; const uint8_t *p = (const uint8_t *)h[i];
         for (;;) { op_hdr hh; memcpy(&hh, p, sizeof hh); ops++; if (hh.op == OP_DRAW || hh.op == OP_DRAW_IDX) draws++; if (hh.op == OP_CALL) calls++; if (hh.op == OP_END || hh.size < 8 || ops > 1000000) break; p += hh.size; }
         LOG("[cmd] Submit %d/%d handle=%#llx ops=%u draws=%u calls=%u", i, n, (unsigned long long)h[i], ops, draws, calls); }
-    if (getenv("TOTK_CHAIN_LOG")) { static int k; if (k++ < 20) guest_chain("Submit"); }
+    if (chainlog_env()) { static int k; if (k++ < 20) guest_chain("Submit"); }   /* TOTK: read once (Yong Li c0c6b26) */
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
     /* TOTK diagnostic (TOTK_WATCH_ADDR): submissions in progress, and their start / end times, to line up guest writes with replay */
     atomic_fetch_add(&dm_submit_busy, 1);
@@ -2681,9 +2740,14 @@ static void tsummary(uint64_t frame) {
         { static uint64_t pun, puns; uint64_t un = 0, uns = 0; void mtl_upload_wait_stats(uint64_t *, uint64_t *); mtl_upload_wait_stats(&un, &uns);
           if (pf && frame > pf) LOG("[nvn] 上传槽等待 至帧 %llu：每帧 %.2f 次 / %.3f ms", frame, (double)(un - pun) / (double)(frame - pf), (double)(uns - puns) / 1e6 / (double)(frame - pf));
           pun = un; puns = uns; }
-        { static uint64_t pcc; uint64_t mtl_chunk_commits(void), cc = mtl_chunk_commits();
-          if (pf && frame > pf) LOG("[nvn] 分段提交 至帧 %llu：每帧额外 %.2f 段", frame, (double)(cc - pcc) / (double)(frame - pf));
-          pcc = cc; }
+        { static uint64_t pcc, pct; uint64_t mtl_chunk_commits(void), cc = mtl_chunk_commits(), mtl_chunk_time_commits(void), ct = mtl_chunk_time_commits();
+          if (pf && frame > pf) LOG("[nvn] 分段提交 至帧 %llu：每帧额外 %.2f 段（其中按回放时间 %.2f 段）", frame, (double)(cc - pcc) / (double)(frame - pf), (double)(ct - pct) / (double)(frame - pf));
+          pcc = cc; pct = ct; }
+        { static uint64_t pd[2], ps[6]; uint64_t d[2], v[6]; void mtl_discard_calls(uint64_t[2]), mtl_store_dc_stats(uint64_t[6]); mtl_discard_calls(d); mtl_store_dc_stats(v);
+          if (pf && frame > pf) { double nf = (double)(frame - pf);
+            LOG("[nvn] 丢弃与空通道 至帧 %llu：DiscardColor %.2f / DiscardDepthStencil %.2f 次每帧；通道内标记 %.2f 个附件，其中 %.2f 个因丢弃写回 DontCare、%.2f 次读入改 DontCare；空通道 %.2f 个、其附件 %.2f 个写回 DontCare", frame,
+                (d[0] - pd[0]) / nf, (d[1] - pd[1]) / nf, (v[0] - ps[0]) / nf, (v[1] - ps[1]) / nf, (v[2] - ps[2]) / nf, (v[3] - ps[3]) / nf, (v[4] - ps[4]) / nf); }
+          memcpy(pd, d, sizeof pd); memcpy(ps, v, sizeof ps); }
         if (synclog_env() && pf && frame > pf) { static uint64_t pc[2], pb[2], pn[2], pw[2]; double nf = (double)(frame - pf);
           for (int k = 0; k < 2; k++) { uint64_t c = atomic_load(&g_sw_calls[k]), b = atomic_load(&g_sw_blocked[k]), n = atomic_load(&g_sw_ns[k]), w = atomic_load(&g_sw_newest[k]);
             LOG("[nvn] CPU 等同步 至帧 %llu：%s 每帧 %.2f 次，其中真的等 %.2f 次 / %.3f ms，等的是最近一次提交 %.2f 次", frame, k ? "取图同步" : "栅栏同步", (c - pc[k]) / nf, (b - pb[k]) / nf, (n - pn[k]) / 1e6 / nf, (w - pw[k]) / nf);
@@ -2706,10 +2770,10 @@ static void tsummary(uint64_t frame) {
             LOG("[nvn] 渲染通道 至帧 %llu：每帧 %.1f 个，其中分层通道 %.2f 个，并入的设目标 %.2f 次，因绘制不能写层号退回 %.2f 次", frame,
                 (v[0] - pl[0]) / nf, (v[1] - pl[1]) / nf, (v[2] - pl[2]) / nf, (v[3] - pl[3]) / nf); }
           memcpy(pl, v, sizeof pl); }
-        { static uint64_t pr[6]; uint64_t v[6]; void mtl_ren_stats(uint64_t[6]); mtl_ren_stats(v);
+        { static uint64_t pr[9]; uint64_t v[9]; void mtl_ren_stats(uint64_t[9]); mtl_ren_stats(v);
           if (pf && frame > pf) { double nf = (double)(frame - pf);
-            LOG("[nvn] uniform 换副本 至帧 %llu：每帧更新 %.1f 次，新副本 %.1f 个 / %.1f KB，提前写回 %.2f 次，开编码器后才发现重叠 %.2f 次，表满回退 %.2f 次", frame,
-                (v[0] - pr[0]) / nf, (v[1] - pr[1]) / nf, (v[2] - pr[2]) / nf / 1024, (v[3] - pr[3]) / nf, (v[4] - pr[4]) / nf, (v[5] - pr[5]) / nf); }
+            LOG("[nvn] uniform 换副本 至帧 %llu：每帧更新 %.1f 次（其中 %.1f 次与最新覆盖更新相同、已丢弃，%.1f 次被新更新整段覆盖、已从日志删除），新副本 %.1f 个 / %.1f KB（其中增量 %.1f 个），提前写回 %.2f 次，开编码器后才发现重叠 %.2f 次，表满回退 %.2f 次", frame,
+                (v[0] - pr[0]) / nf, (v[7] - pr[7]) / nf, (v[8] - pr[8]) / nf, (v[1] - pr[1]) / nf, (v[2] - pr[2]) / nf / 1024, (v[6] - pr[6]) / nf, (v[3] - pr[3]) / nf, (v[4] - pr[4]) / nf, (v[5] - pr[5]) / nf); }
           memcpy(pr, v, sizeof pr); }
         if (frame % 300 == 0) { unsigned wn = 0; uint32_t wq = dm_guest_work_qos(&wn); thread_extended_info_data_t xi; mach_msg_type_number_t xc = THREAD_EXTENDED_INFO_COUNT; int okx = thread_info(pthread_mach_thread_np(pthread_self()), THREAD_EXTENDED_INFO, (thread_info_t)&xi, &xc) == KERN_SUCCESS;
             thread_time_constraint_policy_data_t tp; mach_msg_type_number_t tc = THREAD_TIME_CONSTRAINT_POLICY_COUNT; boolean_t def = 0; int rt_live = thread_policy_get(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&tp, &tc, &def) == KERN_SUCCESS && !def;   // def = 1：实时策略没在生效（没设上 / 被撤） | def = 1: the real-time policy is not in effect (never set / revoked)
@@ -2882,8 +2946,15 @@ static uint64_t present_period(const win_t *o) {
                                     m == MFX_MAX ? (g_uncapped ? "补帧 不限帧：不限帧率，每帧补一帧" : "补帧 不限帧：按游戏的出图间隔，每帧补一帧") :
                                     g_uncapped ? "补帧关：不限帧率" : "补帧关：按游戏的出图间隔"); was = m; }
     if (m == MFX_30 || game_holds_30()) return 1000000000ull / 30;   /* exactly 30 fps, by display ticks or by our own clock */
-    uint64_t period = hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
-    int cap = atomic_load(&g_fps_cap);   /* settings menu: a cap only lengthens the wait, never shortens it */
+    if (hz <= 0) return 0;
+    uint64_t period = (uint64_t)itv * 1000000000ull / (uint64_t)hz;
+    /* 帧率上限已经体现在 hz 上（自有时钟按 30 或 40），游戏再叠加间隔 2 会把帧率又折半
+       (limit 30 alternated 30 / 15 fps while the camera moved)。除非 hz 本身更慢，这里不低于 30 fps。
+       | A frame rate limit already sets hz (the own clock at 30 or 40); the game's present interval 2 on top halved it
+       again. Never slower than 30 fps here unless hz itself is. */
+    uint64_t floor30 = 1000000000ull / 30, one = 1000000000ull / (uint64_t)hz;
+    if (itv > 1 && period > floor30) period = one > floor30 ? one : floor30;
+    int cap = atomic_load(&g_fps_cap);   /* 设置菜单：上限只会拉长等待，不会缩短 | a cap only lengthens the wait, never shortens it */
     if (cap > 0) { uint64_t lim = 1000000000ull / (uint64_t)cap; if (period < lim) period = lim; }
     return period;
 }
@@ -2899,7 +2970,10 @@ void dm_nvn_probe_present_interval(void) {
         win_t w = {.interval = interval}; g_hz = hz; g_display_mode = display; g_uncapped = uncapped;
         atomic_store(&g_uncapped_interval, neg && atoi(neg) == 11 ? 0 : on);
         unsigned expected = display || (uncapped && on && !dm_detclock_enabled()) || interval <= 0 ? 1u : (unsigned)interval;
-        if (present_ticks(&w) != expected || present_period(&w) != (uint64_t)expected * 1000000000ull / hz)
+        /* 与 present_period 一致：间隔 2 以上不再把帧率折半到 30 以下（hz 自己更慢时除外） | same floor as present_period: an interval of 2 or more never halves the rate below 30 fps (unless hz itself is slower) */
+        uint64_t want = (uint64_t)expected * 1000000000ull / hz;
+        if (expected > 1 && want > 1000000000ull / 30) want = 1000000000ull / hz > 1000000000ull / 30 ? 1000000000ull / hz : 1000000000ull / 30;
+        if (present_ticks(&w) != expected || present_period(&w) != want)
             die("present interval probe: effective pacing differs from expected");
         checked++;
     }
