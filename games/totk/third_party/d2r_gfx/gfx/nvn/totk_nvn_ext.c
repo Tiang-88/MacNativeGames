@@ -47,7 +47,7 @@ NVN(nvnMemoryPoolGetSize, size_t, const NVNmemoryPool *p) { return (size_t)((con
 void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n);
 NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
     if (off < 0) return;
-    { static int q; if (q < 3000 && n >= 4096) { q++; LOG("[poolinv] mem=%p off=%lld n=%zu", (void *)((const pool_t *)p)->mem, (long long)off, n); } }
+    { static int q, on_ = -1; if (on_ < 0) on_ = getenv("DM_NVN_POOLLOG") != NULL; if (on_ && q < 3000 && n >= 4096) { q++; LOG("[poolinv] mem=%p off=%lld n=%zu", (void *)((const pool_t *)p)->mem, (long long)off, n); } }
     mtl_pool_invalidate((const pool_t *)p, (uint64_t)off, n);
 }
 
