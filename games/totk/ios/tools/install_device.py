@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sign the unsigned TOTK IPA with your own Xcode team and install it on a connected iPhone / iPad.
+"""Sign the unsigned TOTK (or Breath of the Wild) app with your own Xcode team and install it on an iPhone / iPad / Vision Pro.
 
 A free (Personal Team) Apple ID signs for 7 days, a paid membership for a year: run this again to renew. Reinstalling
 with the same team and bundle identifier keeps the saves and the shader cache (they are in the app's Documents).
@@ -35,27 +35,30 @@ def devices():
     with tempfile.NamedTemporaryFile(suffix='.json') as f:
         run(['xcrun','devicectl','list','devices','--json-output',f.name], capture_output=True)
         return [d for d in json.load(open(f.name))['result']['devices']
-                if d.get('hardwareProperties',{}).get('platform') == 'iOS']
+                if d.get('hardwareProperties',{}).get('platform') in ('iOS', 'visionOS')]
 
 def pick_device(name):
     devs = devices()
     match = [d for d in devs if name in (d['deviceProperties'].get('name'), d['identifier'], d['hardwareProperties'].get('udid'))] if name else devs
     if len(match) != 1:
         listed = '\n'.join(f"  {d['deviceProperties'].get('name')} ({d['hardwareProperties'].get('marketingName')})" for d in devs)
-        sys.exit(f"choose the device with --device <name>:\n{listed}" if devs else 'no paired iPhone / iPad found: connect it with a cable and trust this Mac')
+        sys.exit(f"choose the device with --device <name>:\n{listed}" if devs else 'no paired iPhone / iPad / Vision Pro found: pair it with this Mac and enable Developer Mode')
     return match[0]
 
-def profile(team, bundle_id, udid):
+def profile(team, bundle_id, udid, platform='ios'):
     """Build an empty app with the game's bundle identifier and entitlements; Xcode makes the profile for it."""
-    proj = CACHE/bundle_id; proj.mkdir(parents=True, exist_ok=True)
+    vision = platform == 'visionos'
+    project_platform = 'visionOS' if vision else 'iOS'
+    sdk = 'xros' if vision else 'iphoneos'
+    proj = CACHE/(bundle_id + ('.visionos' if vision else '')); proj.mkdir(parents=True, exist_ok=True)
     (proj/'main.m').write_text('int main(void) { return 0; }\n')
     (proj/'TOTK.entitlements').write_bytes(plistlib.dumps({ENTITLEMENT: True}))
     (proj/'project.yml').write_text(f'''name: TOTKSigning
-options: {{deploymentTarget: {{iOS: "26.0"}}}}
+options: {{deploymentTarget: {{{project_platform}: "26.0"}}}}
 targets:
   TOTK:
     type: application
-    platform: iOS
+    platform: {project_platform}
     sources: [main.m]
     settings:
       GENERATE_INFOPLIST_FILE: YES
@@ -75,7 +78,7 @@ targets:
     if r.returncode:
         errors = [l for l in log.read_text(errors='replace').splitlines() if 'error:' in l]
         sys.exit('Xcode could not make a provisioning profile:\n' + '\n'.join(errors[-8:]) + f'\nfull log: {log}')
-    app = derived/'Build/Products/Debug-iphoneos/TOTK.app'
+    app = derived/f'Build/Products/Debug-{sdk}/TOTK.app'
     return app/'embedded.mobileprovision', app
 
 def identity_of(signed_app):
@@ -92,42 +95,62 @@ def device_files(dev, bundle_id, sub):
     device stale before failing (2026-10-23, the phone had locked)."""
     with tempfile.NamedTemporaryFile(suffix='.json') as f:
         r = subprocess.run(['xcrun','devicectl','device','info','files','--device',dev,'--domain-type','appDataContainer',
-                            '--domain-identifier',bundle_id,'--subdirectory',sub,'--json-output',f.name], capture_output=True)
+                            '--domain-identifier',bundle_id,'--subdirectory',sub,'--no-recurse','--json-output',f.name], capture_output=True)
         if r.returncode:
-            if sub != 'Documents' and device_files(dev, bundle_id, 'Documents') is not None: return {}   # reachable: the folder is not there yet
-            sys.exit(f'cannot read Documents/{sub} on the device (is it connected by cable and unlocked?): {r.stderr.decode(errors="replace").strip()[-300:]}')
-        files = json.load(open(f.name)).get('result', {}).get('files', [])
+            # A readable Documents folder alone says nothing about an existing child's permissions or availability.
+            # Only the immediate parent's successful listing can prove that this exact leaf is absent.
+            if sub != 'Documents':
+                folder = Path(sub)
+                if folder.name not in device_files(dev, bundle_id, folder.parent.as_posix()): return {}
+            sys.exit(f'cannot read {sub} on the device (is it connected by cable and unlocked?): {r.stderr.decode(errors="replace").strip()[-300:]}')
+        try:
+            report = json.loads(Path(f.name).read_text())
+            files = report['result']['files']
+            if report.get('error') or not isinstance(files, list): raise ValueError('not a successful file listing')
+        except (OSError, ValueError, KeyError, TypeError):
+            sys.exit(f'cannot read {sub} on the device: invalid file listing; no absence was confirmed')
     return {Path(x.get('relativePath', x.get('name', ''))).name: x.get('metadata', {}).get('size', 0) for x in files}   # devicectl's JSON
 
 def push_game_data(dev, bundle_id, image):
     """The RomFS image into Documents/GameData as romfs.bin.000, .001, ... (ios/Sources/main.m reads it there), then
-    romfs.sha256 naming it, so the next install skips it."""
+    romfs.sha256 naming it, so the next install skips it. While copying, the marker says "copying <sha256>": a copy that
+    stopped (the cable, a locked phone) goes on from the parts of that image already there at their full size."""
     sha = json.loads((image.parent/'index.json').read_text())['romfs_sha256']
     size = image.stat().st_size; parts = (size + PART - 1) // PART
     have = device_files(dev, bundle_id, 'Documents/GameData')
-    if have.get('romfs.sha256') == 64 + 1 and all(f'romfs.bin.{i:03d}' in have for i in range(parts)):
+    expected_sizes = {f'romfs.bin.{i:03d}': min(PART, size - i * PART) for i in range(parts)}
+    copying = f'copying {sha}'
+    marker = None
+    if have.get('romfs.sha256') in (64 + 1, len(copying) + 1):
         with tempfile.TemporaryDirectory() as d:
             got = Path(d)/'romfs.sha256'
             r = subprocess.run(['xcrun','devicectl','device','copy','from','--device',dev,'--domain-type','appDataContainer',
                                 '--domain-identifier',bundle_id,'--source','Documents/GameData/romfs.sha256','--destination',got], capture_output=True)
-            if r.returncode == 0 and got.read_text().strip() == sha:
-                print('game data: the device already has this image'); return
-    # every part there at its full size but the marker not (an install stopped between writing "stale" and the first part):
-    # the parts are this image, only the marker is written again
-    if all(have.get(f'romfs.bin.{i:03d}') == min(PART, size - i * PART) for i in range(parts)) and have.get('romfs.sha256') != 64 + 1:
-        with tempfile.TemporaryDirectory() as d:
-            (Path(d)/'romfs.sha256').write_text(sha + '\n')
-            run(['xcrun','devicectl','device','copy','to','--device',dev,'--domain-type','appDataContainer','--domain-identifier',
-                 bundle_id,'--source',Path(d)/'romfs.sha256','--destination','Documents/GameData/romfs.sha256'], capture_output=True)
-        print('game data: every part is on the device; only its marker was written again'); return
-    print(f'game data: copying {size / 2**30:.1f} GiB in {parts} parts (once; later installs keep it)')
+            if r.returncode or not got.is_file():
+                sys.exit('game data: cannot read the existing image marker; keep the device unlocked and connected, then retry')
+            marker = got.read_text().strip()
+    if marker == sha and all(have.get(name) == length for name, length in expected_sizes.items()):
+        print('game data: the device already has this image'); return
+    # Equal lengths alone cannot identify an image. Reuse complete parts only after reading a marker of this SHA.
+    # A committed image with a truncated part can be repaired too, after marking the transfer in progress again.
+    resume = marker in (sha, copying)
+    print(f'game data: copying {size / 2**30:.1f} GiB in {parts} parts (once; later installs keep it)' +
+          (', going on from the parts already there' if resume else ''), flush=True)
     with tempfile.TemporaryDirectory() as d, open(image, 'rb') as src:
         def copy(local, name):
-            run(['xcrun','devicectl','device','copy','to','--device',dev,'--domain-type','appDataContainer','--domain-identifier',
-                 bundle_id,'--source',local,'--destination',f'Documents/GameData/{name}'], capture_output=True)
-        (Path(d)/'romfs.sha256').write_text('stale\n'); copy(Path(d)/'romfs.sha256', 'romfs.sha256')   # until every part is there
+            for attempt in range(3):
+                r = subprocess.run(['xcrun','devicectl','device','copy','to','--device',dev,'--domain-type','appDataContainer',
+                                    '--domain-identifier',bundle_id,'--source',str(local),'--destination',f'Documents/GameData/{name}'],
+                                   capture_output=True, text=True)
+                if r.returncode == 0: return
+                print(f'  {name}: copy failed (attempt {attempt + 1} of 3): {(r.stderr or r.stdout).strip().splitlines()[-1:]}', flush=True)
+                time.sleep(10)
+            sys.exit(f'game data: {name} could not be copied (keep the device unlocked and connected); run this again to go on from there')
+        if marker != copying: (Path(d)/'romfs.sha256').write_text(copying + '\n'); copy(Path(d)/'romfs.sha256', 'romfs.sha256')   # until every part is there
         for i in range(parts):
             part = Path(d)/f'romfs.bin.{i:03d}'
+            if resume and have.get(part.name) == min(PART, size - i * PART):
+                src.seek(min(PART, size - i * PART), os.SEEK_CUR); print(f'  part {i + 1}/{parts}: already there', flush=True); continue
             part.write_bytes(src.read(PART)); copy(part, part.name); part.unlink()
             print(f'  part {i + 1}/{parts}', flush=True)
         (Path(d)/'romfs.sha256').write_text(sha + '\n'); copy(Path(d)/'romfs.sha256', 'romfs.sha256')
@@ -154,6 +177,12 @@ def write_pack(seed, names, d, folder, size, done):
         write((seed/name).read_bytes())
     write((0).to_bytes(2, 'little'))
     out.close(); done(d/f'{folder}.pack.{part:03d}')
+
+def seed_beside(ipa, app):
+    """The startup shaders build_ipa.py --image-outside leaves beside the IPA or .app (<name>-shader-seed), when the app
+    carries none of its own: an .ipa (the README's install) as well as an unsigned .app folder. None otherwise."""
+    seed = ipa.with_name(ipa.stem + '-shader-seed')
+    return seed if not (app/'GameData/shader-seed').is_dir() and (seed/'fingerprint.txt').is_file() else None
 
 def push_seed(dev, bundle_id, seed):
     """The startup shaders of an app built with --ios-game-data documents (<app>-shader-seed beside it) into Documents/
@@ -182,23 +211,46 @@ def push_seed(dev, bundle_id, seed):
         write_pack(seed, names, Path(d), folder, PART, push)
         got.write_text(f'{folder}\n{fp}\n'); copy(got, 'shader-seed.txt')
 
+def built_bundle_id(ipa, team):
+    """The identifier build_app.py gave the app (org.macnativegames.totk, or .botw for Breath of the Wild); a .app folder
+    signed before carries it with the team suffix this script added."""
+    try:
+        if ipa.is_dir(): raw = (ipa/'Info.plist').read_bytes()
+        else:
+            with zipfile.ZipFile(ipa) as z: raw = z.read('Payload/TOTK.app/Info.plist')
+        bid = plistlib.loads(raw).get('CFBundleIdentifier', '')
+    except (OSError, KeyError, zipfile.BadZipFile, plistlib.InvalidFileException): bid = ''
+    bid = bid.removesuffix('.' + team.lower())
+    return bid if bid.startswith('org.macnativegames.') else 'org.macnativegames.totk'
+
+def built_platform(ipa):
+    """Choose signing from the app, so an iPad-compatible build on a Vision Pro still gets an iOS profile."""
+    if ipa.is_dir(): raw = (ipa/'Info.plist').read_bytes()
+    else:
+        with zipfile.ZipFile(ipa) as z: raw = z.read('Payload/TOTK.app/Info.plist')
+    info = plistlib.loads(raw)
+    return 'visionos' if info.get('DTPlatformName') == 'xros' or 'XROS' in info.get('CFBundleSupportedPlatforms', []) else 'ios'
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('ipa', type=Path, help='the unsigned IPA (or .app folder) from build_app.py --platform ios')
+    ap.add_argument('ipa', type=Path, help='the unsigned IPA (or .app folder) from build_app.py --platform ios or visionos')
     ap.add_argument('--device', help='device name (as in Finder) or identifier; needed when several are paired')
     ap.add_argument('--team', help='Apple team ID (default: the only team with an Apple Development certificate)')
-    ap.add_argument('--bundle-id', help='default: org.macnativegames.totk.<team>, so it is free to register on your team')
+    ap.add_argument('--bundle-id', help='default: the build\'s identifier (org.macnativegames.totk or .botw) + .<team>, so it is free to register on your team')
     ap.add_argument('--game-data', type=Path, help='romfs.bin (index.json beside it) for an IPA built with --ios-game-data documents')
     a = ap.parse_args()
     team = a.team or (lambda t: t[0] if len(t) == 1 else sys.exit(
         f'choose the team with --team: {", ".join(t)}' if t else 'no Apple Development certificate: add your Apple ID in Xcode > Settings > Accounts'))(teams())
-    bundle_id = a.bundle_id or f'org.macnativegames.totk.{team.lower()}'
+    bundle_id = a.bundle_id or f'{built_bundle_id(a.ipa, team)}.{team.lower()}'
     dev = pick_device(a.device)
     udid = dev['hardwareProperties']['udid']
     print(f"team {team}, bundle {bundle_id}, device {dev['deviceProperties'].get('name')} ({udid})")
 
     print('provisioning profile: asking Xcode')
-    prov, signed = profile(team, bundle_id, udid)
+    platform = built_platform(a.ipa)
+    if platform == 'visionos' and dev['hardwareProperties'].get('platform') != 'visionOS':
+        sys.exit('this is a native Vision Pro app: choose a paired Vision Pro with --device')
+    prov, signed = profile(team, bundle_id, udid, platform)
     info = plistlib.loads(out(['security','cms','-D','-i',prov]).encode())
     ents = info['Entitlements']
     if not ents.get(ENTITLEMENT):
@@ -225,12 +277,12 @@ def main():
                                                                 'get-task-allow', ENTITLEMENT) if k in ents}))
     print('signing (a few minutes: every game file is hashed)')
     run(['codesign','--force','--sign',identity_of(signed),'--entitlements',entfile,'--generate-entitlement-der',app])
-    print('installing (a few minutes over the cable)')
+    print('installing over Wi-Fi' if dev['hardwareProperties'].get('platform') == 'visionOS' else 'installing (a few minutes over the cable)')
     run(['xcrun','devicectl','device','install','app','--device',dev['identifier'],app])
     if a.game_data: push_game_data(dev['identifier'], bundle_id, a.game_data)
-    seed = a.ipa.with_name(a.ipa.stem + '-shader-seed')   # build_ipa.py --image-outside
-    if a.ipa.is_dir() and not (app/'GameData/shader-seed').is_dir() and (seed/'fingerprint.txt').is_file():
+    if seed := seed_beside(a.ipa, app):
         push_seed(dev['identifier'], bundle_id, seed)
-    print('installed. First time on this device: Settings > General > VPN & Device Management > trust your Apple ID.')
+    management = 'Device Management' if dev['hardwareProperties'].get('platform') == 'visionOS' else 'VPN & Device Management'
+    print(f'installed. First time on this device: Settings > General > {management} > trust your Apple ID.')
 
 if __name__ == '__main__': main()
