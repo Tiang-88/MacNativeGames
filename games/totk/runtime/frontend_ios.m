@@ -73,6 +73,8 @@ uint64_t front_game_res(int docked){(void)docked;return (720ULL<<32)|1280;}
 static _Atomic int appActive=1;
 int runtime_front_focus(void){return atomic_load(&appActive);}
 void mtl_app_active(int active);
+void mtl_hud_safe_area(int w,int h,int side,int bottom);   /* gfx/nvn/nvn_mtl.m: the HUD boxes keep out of the safe area */
+void runtime_ios_sync_safe_area(UIView *host);
 /* Not active (background, Control Center, lock): stop GPU submission (iOS rejects background GPU work) and tell the game focus changed, like the Mac window. */
 static void app_active_changed(int active){
  if(atomic_exchange(&appActive,active)==active)return;
@@ -83,6 +85,11 @@ static void app_active_changed(int active){
 void runtime_front_request_close(void){fprintf(stderr,"[totk] close requested; iOS apps are closed by the user\n");}
 void runtime_front_text_test(const char *op,const char *text){(void)text;fprintf(stderr,"[totk] text entry test \"%s\" ignored: iOS has no text entry bar (the keyboard request is cancelled)\n",op?op:"");}
 
+/* The display link's rate, which paces the game (mtl_display_hz): 60 on every iPhone / iPad, also a ProMotion one, whose
+   screen reports 120 (UIScreen.maximumFramesPerSecond with CADisableMinimumFrameDurationOnPhone). */
+#define TOTK_IOS_LINK_HZ 60
+int front_display_link_hz(void){return TOTK_IOS_LINK_HZ;}
+
 @interface TOTKVsync:NSObject
 @end
 @implementation TOTKVsync
@@ -90,11 +97,14 @@ void runtime_front_text_test(const char *op,const char *text){(void)text;fprintf
 @end
 static TOTKVsync *vsyncTarget;
 
-/* Called on the main thread by the app before the game thread starts. */
-void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
- bootStartNS=runtime_now_ns();
- metalLayer=layer;metalLayer.device=MTLCreateSystemDefaultDevice();metalLayer.pixelFormat=MTLPixelFormatBGRA8Unorm;metalLayer.framebufferOnly=NO;
+/* visionOS windows resize after launch; keep the drawable and camera aspect in step with the view. */
+void runtime_ios_sync_drawable(UIView *host){
+ if(!metalLayer||host.bounds.size.width<1||host.bounds.size.height<1)return;
+#if TARGET_OS_VISION
+ CGFloat s=host.traitCollection.displayScale>0?host.traitCollection.displayScale:2;
+#else
  CGFloat s=host.window.screen.nativeScale>0?host.window.screen.nativeScale:UIScreen.mainScreen.nativeScale;
+#endif
  metalLayer.contentsScale=s;
  /* TOTK_IOS_DRAWABLE_H (default 720; 0 = native pixels): build the drawable this many pixels tall at the view's aspect, so the
     game picture (1280x720 canvas) lands about 1:1 and the system compositor scales it to the screen instead of our GPU. */
@@ -103,27 +113,54 @@ void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
  /* the 16:9 picture should get about want rows: a screen narrower than 16:9 (an iPad, about 4:3; 2026-10-17) holds it by
     width, so there the drawable is want*16/9 columns wide (1281x890 on a 2360x1640 iPad); an iPhone keeps want rows */
  if(want>0){double h=vw/vh<16.0/9.0?round(want*16.0/9.0*vh/vw):(double)want;if(h<vh){vw=round(vw*h/vh);vh=h;}}
+ if(CGSizeEqualToSize(metalLayer.drawableSize,CGSizeMake(vw,vh)))return;
  metalLayer.drawableSize=CGSizeMake(vw,vh);
  fprintf(stderr,"[totk] view drawable %.0fx%.0f (screen scale %.1f, TOTK_IOS_DRAWABLE_H=%ld)\n",vw,vh,s,want);runtime_aspect_view(vw,vh);   /* full screen: the camera takes the drawable's shape (aspect_patch.h) */
+ runtime_ios_sync_safe_area(host);
+}
+/* The safe area (notch, rounded corners, home indicator) in drawable pixels: the HUD's corner boxes keep out of it
+   (nvn_mtl.m). The view's safeAreaInsetsDidChange calls it too: at the first drawable the view is in no window yet and
+   the insets are 0. */
+void runtime_ios_sync_safe_area(UIView *host){
+ CGSize px=metalLayer?metalLayer.drawableSize:CGSizeZero;
+ if(px.width<1||host.bounds.size.width<1)return;
+ UIEdgeInsets in=host.safeAreaInsets;double k=px.width/host.bounds.size.width;   /* points -> drawable pixels */
+ mtl_hud_safe_area((int)px.width,(int)px.height,(int)lround(MAX(in.left,in.right)*k),(int)lround(in.bottom*k));
+}
+
+/* Called on the main thread by the app before the game thread starts. */
+void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
+ bootStartNS=runtime_now_ns();
+ metalLayer=layer;metalLayer.device=MTLCreateSystemDefaultDevice();metalLayer.pixelFormat=MTLPixelFormatBGRA8Unorm;metalLayer.framebufferOnly=NO;
+ runtime_ios_sync_drawable(host);
  bootOverlay=[[UIView alloc] initWithFrame:host.bounds];bootOverlay.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
  bootOverlay.backgroundColor=[UIColor colorWithRed:0.035 green:0.075 blue:0.09 alpha:1];
  CGFloat w=host.bounds.size.width,h=host.bounds.size.height;
  bootStage=[[UILabel alloc] initWithFrame:CGRectMake(0,h/2-50,w,36)];bootStage.text=@(TOTK_UI("正在启动海拉鲁","Starting Hyrule"));bootStage.textColor=UIColor.whiteColor;
  bootStage.font=[UIFont systemFontOfSize:24 weight:UIFontWeightSemibold];bootStage.textAlignment=NSTextAlignmentCenter;
- bootDetail=[[UILabel alloc] initWithFrame:CGRectMake(0,h/2-8,w,24)];bootDetail.text=@(TOTK_UI("正在准备游戏环境","Preparing the game environment"));bootDetail.textColor=[UIColor colorWithWhite:0.72 alpha:1];
+ bootDetail=[[UILabel alloc] initWithFrame:CGRectMake(24,h/2-8,w-48,36)];bootDetail.text=@(TOTK_UI("正在准备游戏环境","Preparing the game environment"));bootDetail.textColor=[UIColor colorWithWhite:0.72 alpha:1];
  bootDetail.font=[UIFont systemFontOfSize:14];bootDetail.textAlignment=NSTextAlignmentCenter;
+ bootDetail.numberOfLines=2;bootDetail.adjustsFontSizeToFitWidth=YES;bootDetail.minimumScaleFactor=0.6;   /* a message (no game data) fits in two lines */
  bootProgress=[[UIProgressView alloc] initWithFrame:CGRectMake(w/2-140,h/2+30,280,8)];bootProgress.hidden=YES;
  [bootOverlay addSubview:bootStage];[bootOverlay addSubview:bootDetail];[bootOverlay addSubview:bootProgress];[host addSubview:bootOverlay];
  NSNotificationCenter *nc=NSNotificationCenter.defaultCenter;
  [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n){(void)n;app_active_changed(0);}];
  [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n){(void)n;app_active_changed(1);}];
  vsyncTarget=[TOTKVsync new];displayLink=[CADisplayLink displayLinkWithTarget:vsyncTarget selector:@selector(tick:)];
- displayLink.preferredFrameRateRange=CAFrameRateRangeMake(60,60,60);[displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+ displayLink.preferredFrameRateRange=CAFrameRateRangeMake(TOTK_IOS_LINK_HZ,TOTK_IOS_LINK_HZ,TOTK_IOS_LINK_HZ);[displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 }
 /* The app already runs the loader on a game thread with a large stack; the event loop belongs to UIKit. */
+#if TARGET_OS_IOS
+extern void totk_phone_motion_start(void);
+extern void totk_phone_haptics_start(void);
+#endif
 void runtime_front_run(void(*callback)(void)){
  if(!metalLayer)runtime_fail("iOS view not attached before boot");
  runtime_gamepad_start();
+#if TARGET_OS_IOS
+ /* After the controller scan, on the main queue: the phone's sensor is only used when no controller is attached. */
+ dispatch_async(dispatch_get_main_queue(), ^{ totk_phone_motion_start(); totk_phone_haptics_start(); });
+#endif
  @autoreleasepool{callback();}
 }
 static int viReady;

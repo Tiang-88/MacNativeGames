@@ -32,6 +32,7 @@
 #include <mach/mach.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
+#include <TargetConditionals.h>
 
 #define R_TIMEOUT     0xEA01u   // 内核模块 1，描述 117 | Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -387,9 +388,6 @@ static void core_wait_report(thr_t *w, uint64_t since) {
     fputc('\n',stderr);
     pthread_mutex_lock(&G);
 }
-/* 上面 BotW 的详细等待报告两种游戏都编（core_take 两侧都调用 core_wait_report），下面才是 TOTK 专用的异步抢占 */
-/* BotW's detailed wait report above is compiled for both games (core_take calls core_wait_report on both sides); only the
-   asynchronous preemption below is Tears of the Kingdom's own. */
 #ifndef GAME_BOTW
 /* Asynchronous preemption for Tears of the Kingdom, as Breath of the Wild has (above, botw.md). Horizon
    gives a core to a strictly better thread the moment that thread is ready; here a better waiter only marked the owner,
@@ -397,7 +395,7 @@ static void core_wait_report(thr_t *w, uint64_t since) {
    owner running game code (median 4.5 ms). A waiter now signals (SIGUSR2) each owner it beats, again every millisecond
    while it waits, and the owner gives its core up in the handler only when interrupted in the game's own code at the
    top level (pc in a module's original code, host-stack slot set: no host lock held, not in libc), as in BotW. Who may
-   preempt: a strictly better priority. TOTK_ASYNC_PREEMPT=0 leaves the preemption at SVC entry only (as before). */
+   preempt: a strictly better priority. Off by default (preemption at SVC entry only, as before); TOTK_ASYNC_PREEMPT=1 turns it on. */
 #include <string.h>
 #include <sys/ucontext.h>
 extern uint64_t runtime_hle_tsd_off;   // hle_stack.c
@@ -410,13 +408,22 @@ extern pthread_key_t runtime_keys[8];   // loader.c: [2] holds the game's thread
 static void totk_preempt_signal(int sig, siginfo_t *si, void *context);
 static int totk_ap_on(void) {   // holding G
     if (g_totk_ap < 0) {
-        const char *e = getenv("TOTK_ASYNC_PREEMPT"); g_totk_ap = !(e && !strcmp(e, "0"));
+        /* On by default on the Mac since 2026-10-25 (user's choice; two short 1.4.3 runs at Lookout Landing: dropped
+           refreshes 1.42% -> 0.84%, frame-time p95 15.2 -> 14.3 ms, too short to be conclusive; the author measured
+           2.61% -> 0.93%). TOTK_ASYNC_PREEMPT=0 turns it off: the first thing to try when a hang, crash or new stutter
+           shows up. Off on iPhone / iPad until it has run there (=1 turns it on). */
+        const char *e = getenv("TOTK_ASYNC_PREEMPT");
+#if TARGET_OS_IPHONE
+        g_totk_ap = e && !strcmp(e, "1");
+#else
+        g_totk_ap = !(e && !strcmp(e, "0"));
+#endif
         if (g_totk_ap) {
             struct sigaction a = {0}; a.sa_sigaction = totk_preempt_signal; a.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
             sigemptyset(&a.sa_mask);
             if (sigaction(SIGUSR2, &a, NULL)) g_totk_ap = 0;
         }
-        fprintf(stderr, "[threads] asynchronous preemption of virtual cores (Horizon's rule): %s\n", g_totk_ap ? "on" : "off (TOTK_ASYNC_PREEMPT=0)");
+        fprintf(stderr, "[threads] asynchronous preemption of virtual cores (Horizon's rule): %s\n", g_totk_ap ? "on (TOTK_ASYNC_PREEMPT=0 turns it off)" : "off (TOTK_ASYNC_PREEMPT=1 turns it on)");
     }
     return g_totk_ap;
 }
@@ -502,15 +509,11 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
     int reported = 0;
     while (t->cur_core < 0) {   // the owners it beats are marked (and, with the asynchronous preemption, signalled again every millisecond)
-        if (!(totk_kick(t) && totk_ap_on())) {
-            if (reported || !core_diag_on()) { pthread_cond_wait(&t->cv, &G); continue; }
-            struct timespec again = {0, CORE_DIAG_NS};   // TOTK_CORE_DIAG: one look at the owners once a wait gets long
-            pthread_cond_timedwait_relative_np(&t->cv, &G, &again);
-            if (t->cur_core < 0 && now_ns() - w0 >= CORE_DIAG_NS) { core_wait_report(t, w0); reported = 1; }
-            continue;
-        }
-        struct timespec again = {0, 1000000};
+        int kick = totk_kick(t) && totk_ap_on();
+        if (!kick && (reported || !core_diag_on())) { pthread_cond_wait(&t->cv, &G); continue; }
+        struct timespec again = {0, kick ? 1000000 : CORE_DIAG_NS};   // TOTK_CORE_DIAG: one look at the owners once a wait gets long
         pthread_cond_timedwait_relative_np(&t->cv, &G, &again);
+        if (!reported && core_diag_on() && t->cur_core < 0 && now_ns() - w0 >= CORE_DIAG_NS) { core_wait_report(t, w0); reported = 1; }
     }
 #endif
 }
@@ -544,6 +547,35 @@ void runtime_core_back(int *away) {
     thr_t *t = me_or_null(); if (!*away || !t) return;
     pthread_mutex_lock(&G); core_take(t); pthread_mutex_unlock(&G);
 }
+/* A pass of a gated spin wait (patch_nso.py "Spin waits", registered builds only): a guest loop that polls memory until
+   another thread changes it. On the Switch it fills only its own core; here it holds a virtual core that the thread it
+   waits for, or a thread that one waits for, may need (Breath of the Wild 1.9.0's job queue, issue #480: workers at
+   priority 44 polled until the main thread took its item, while priority 45-48 threads waited for their cores). A wait
+   is a run of passes through the same loop with no SVC and at most SPIN_GAP_NS between them. Once a run has lasted
+   TOTK_SPIN_HANDOFF_US (default 50 us) and a thread is queued for a virtual core, each pass gives the core to the waiter,
+   whatever its priority, yields the host CPU and takes a core again (the job-queue hook of PR #621 did that on every
+   pass of that one loop). Shorter waits (a lock held for a moment) keep the core: handing it over there made the next
+   pass wait for a lower-priority thread's next SVC. TOTK_SPIN=0 keeps the core always (the gate's own cost only, A/B). */
+#define SPIN_GAP_NS 20000ull
+static _Atomic uint64_t g_spin_passes, g_spin_handoffs;
+static int spin_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_SPIN"); v = !(e && !strcmp(e, "0")); } return v; }
+static uint64_t spin_handoff_ns(void) { static int64_t v = -1; if (v < 0) { const char *e = getenv("TOTK_SPIN_HANDOFF_US"); v = (e ? atoll(e) : 50) * 1000; } return (uint64_t)v; }
+static __thread uint64_t sw_head, sw_t0, sw_last, sw_nsvc;
+void runtime_spin_wait(unsigned module, uint64_t head) {
+    atomic_fetch_add_explicit(&g_spin_passes, 1, memory_order_relaxed);
+    if (!spin_on()) return;
+    thr_t *t = me_or_null(); if (!t || t->cur_core < 0) return;
+    uint64_t now = now_ns(), key = head ^ ((uint64_t)module << 56);
+    if (key != sw_head || t->nsvc != sw_nsvc || now - sw_last > SPIN_GAP_NS) { sw_head = key; sw_t0 = now; sw_nsvc = t->nsvc; }
+    sw_last = now;
+    if (now - sw_t0 < spin_handoff_ns() || !__atomic_load_n(&g_core_wait, __ATOMIC_RELAXED)) return;   // a racy look: a waiter missed now is seen at the next pass
+    atomic_fetch_add_explicit(&g_spin_handoffs, 1, memory_order_relaxed);
+    int away = runtime_core_away();
+    sched_yield();
+    runtime_core_back(&away);
+    sw_last = now_ns();
+}
+uint64_t runtime_spin_passes(void) { return atomic_load_explicit(&g_spin_passes, memory_order_relaxed); }
 // Preemption point at SVC entry: a higher-priority thread waits for this core.
 void runtime_core_checkpoint(void) {
     thr_t *t = me_or_null();
@@ -722,8 +754,20 @@ static void core_table(void) {
         if (n==ROWS) { truncated=1; continue; }
         rows[n++]=(row){t->handle,t->prio,t->core,t->last_svc,t->cur_core>=0,t->mask,dh,dw,dn,dc};
     }
+#ifndef GAME_BOTW
+    uint64_t ap[7]={g_ap_kicks,__atomic_load_n(&g_ap_taken,__ATOMIC_RELAXED),__atomic_load_n(&g_ap_refused,__ATOMIC_RELAXED),
+                    __atomic_load_n(&g_ap_deferred,__ATOMIC_RELAXED),g_ap_skip_host,g_ap_skip_disabled,g_ap_skip_recent};
+    int ap_on=g_totk_ap==1;
+#endif
     pthread_mutex_unlock(&G);
     fprintf(stderr,"[core-table] last %.0f ms; mask: bit 0-2 = virtual cores 0-2\n",span);
+    { uint64_t sp = atomic_load_explicit(&g_spin_passes, memory_order_relaxed); if (sp) fprintf(stderr, "[core-table] spin-wait gate passes so far: %llu, core hand-offs %llu%s\n", (unsigned long long)sp, (unsigned long long)atomic_load_explicit(&g_spin_handoffs, memory_order_relaxed), spin_on() ? "" : " (TOTK_SPIN=0: the core is kept)"); }
+#ifndef GAME_BOTW
+    if (ap_on) fprintf(stderr,"[core-table] asynchronous preemption so far: %llu signals, %llu cores given up in the handler, %llu refused (host code), "
+                       "%llu deferred to SVC 0x36; not signalled: %llu in a host function, %llu with preemption disabled, %llu signalled < 2 ms ago\n",
+                       (unsigned long long)ap[0],(unsigned long long)ap[1],(unsigned long long)ap[2],(unsigned long long)ap[3],
+                       (unsigned long long)ap[4],(unsigned long long)ap[5],(unsigned long long)ap[6]);
+#endif
     for (int i=0;i<n;i++) { const row *r=&rows[i];
         fprintf(stderr,"[core-table]   thread %#x priority %d mask %#llx ideal %d: held %.0f ms (%.0f%%), cpu %.0f ms (%.0f%% of held), waited %.1f ms in %llu waits, last svc %#x%s\n",
             r->handle,r->prio,(unsigned long long)r->mask,r->core,r->held/1e6,span ? 100.0*(r->held/1e6)/span : 0,r->cpu/1e6,
@@ -855,11 +899,7 @@ int svc_thread(int num, uint64_t *regs) {
 
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
-        /* Priorities take the kernel's whole range, 0x00-0x40: a mod's worker thread may sit below the
-           game's own threads (UltraCam uses 0x14), and refusing it is not what the console's kernel does. */
-        if(!regs[1]||!regs[3]||(regs[3]&15)||(int)regs[4]<0||(int)regs[4]>0x40||(int)regs[5]<-3||(int)regs[5]>2){
-            fprintf(stderr,"[totk] CreateThread refused: entry=%#llx arg=%#llx stack=%#llx prio=%d core=%d\n",(unsigned long long)regs[1],(unsigned long long)regs[2],(unsigned long long)regs[3],(int)regs[4],(int)regs[5]);
-            regs[0]=R_BAD_STATE;return 1;}
+        if(!regs[1]||!regs[3]||(regs[3]&15)||(int)regs[4]<28||(int)regs[4]>59||(int)regs[5]<-3||(int)regs[5]>2){regs[0]=R_BAD_STATE;return 1;}
         thr_t *t = calloc(1, sizeof *t);
         if(!t)die("thread allocation");
         t->cur_core = -1;
@@ -924,7 +964,7 @@ int svc_thread(int num, uint64_t *regs) {
         return 1;
     }
     case 0x0C: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)t->prio : 0; pthread_mutex_unlock(&G);return 1; }
-    case 0x0D: { if(regs[1]<0||regs[1]>0x40){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
+    case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
     case 0x0E: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[2], O_THREAD);
                  regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0;pthread_mutex_unlock(&G); return 1; }
     case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)：-1 = 用进程缺省、-2/-3 = 不改理想核；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask): -1 = use the process default, -2/-3 = leave the ideal core unchanged; the host only keeps the bookkeeping
@@ -1280,7 +1320,14 @@ static void dump_threads(unsigned secs) {
             }
     }
 }
-void runtime_dump_threads(void) { dump_threads(0); }   // TOTK_INPUT_FILE "threads"
+void runtime_dump_threads(void) { dump_threads(0); }
+/* runtime/mem_scan.h: the mach ports of the running guest threads, so a diagnostic watchpoint is armed only where the
+   game's code runs (2026-10-27: armed in every thread, a read watch closed the game from a host thread). */
+int runtime_guest_thread_ports(unsigned *out, int max) {
+    int n = 0; pthread_mutex_lock(&G);
+    for (thr_t *t = g_all; t && n < max; t = t->all) if (t->started && !t->exited && t->mport) out[n++] = t->mport;
+    pthread_mutex_unlock(&G); return n;
+}   // TOTK_INPUT_FILE "threads"
 __attribute__((constructor)) static void dump_init(void) {
     const char *c = getenv("TOTK_LISTCHECK");
     if (c) { pthread_t th; pthread_create(&th, NULL, list_check, (void *)(uintptr_t)strtoull(c, NULL, 0)); pthread_detach(th); }

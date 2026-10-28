@@ -180,3 +180,12 @@
 #define GAME_FOLDER "TOTK"   /* the player's data folder under ~/Library/Application Support/MacNativeGames (app/launcher.m) */
 #define GAME_LOG "totk"
 #endif
+/* The game data folder (runtime/game_data.h): a mod build's module tables describe more modules than the game's own, so they
+   live beside the plain ones rather than in place of them. extracted/<TOTK_GAME_DIR> keeps the game's own files either way. */
+#ifdef TOTK_MOD_SUBSDK3
+#define TOTK_GAME_DATA_DIR TOTK_GAME_DIR "-uc"
+#elif defined(TOTK_MOD_SUBSDK1)
+#define TOTK_GAME_DATA_DIR TOTK_GAME_DIR "-mod"
+#else
+#define TOTK_GAME_DATA_DIR TOTK_GAME_DIR
+#endif

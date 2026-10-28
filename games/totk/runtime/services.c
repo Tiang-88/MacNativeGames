@@ -45,10 +45,18 @@ static uint64_t alias_size(void){if(!alias_len)alias_len=alias_requested();retur
 #else
 #define ARENA_TAIL 0
 #endif
+/* TOTK_DRAM_8GB (Mac, docs/mods.md): the 8 GB mode for big texture packs. Unset or "0" leaves the retail layout. */
+static int dram_8gb(void){
+#if TARGET_OS_IPHONE
+ return 0;
+#else
+ static int v=-1;if(v<0){const char *e=getenv("TOTK_DRAM_8GB");v=e&&*e&&strcmp(e,"0");}return v;
+#endif
+}
 #if TARGET_OS_IPHONE
 #define LOW_SIZE_MIN (HEAP_OFF+HEAP_CAP_DEFAULT+ARENA_TAIL)   /* iOS: no slack after the heap cap; address space is scarce */
 #else
-#define LOW_SIZE_MIN (6ULL<<30)
+#define LOW_SIZE_MIN (dram_8gb()?8ULL<<30:6ULL<<30)
 #endif
 #define STACK_OFF 0x10000000ULL
 #define STACK_SIZE 0x10000000ULL
@@ -74,15 +82,15 @@ static uint8_t user_exception_context[0x1000] __attribute__((aligned(0x1000)));
 #else
 #define GAME_PROGRAM_ID 0x0100f2c0115b6000ULL
 #endif
-#define HEAP_CAP_DEFAULT (4ULL<<30)   /* 1.4.3 sets a 2.2 GiB heap during nninitStartup */
+#define HEAP_CAP_DEFAULT (4ULL<<30)   /* 1.4.3 sets a 2.2 GiB heap during nninitStartup; heap_cap() raises it with the pool (the 8 GB mode: ~5.8 GiB) */
 #define HEAP_CAP_MAX (16ULL<<30)   /* largest heap a raised pool can ask for */
 #ifdef TOTK_MOD_SUBSDK1
-_Static_assert(HEAP_OFF+HEAP_CAP_DEFAULT+ARENA_SIZE<=LOW_SIZE_MIN,"module arena must fit the smallest low reservation");
+_Static_assert(HEAP_OFF+HEAP_CAP_DEFAULT+ARENA_SIZE<=(6ULL<<30),"module arena must fit the smallest low reservation");
 #endif
 #define APP_POOL app_pool()
 static uint64_t app_pool(void){static uint64_t v;if(!v){const char *e=getenv("TOTK_APP_POOL");uint64_t extra=(runtime_output_res_extra_bytes()+0x1fffff)&~0x1fffffULL;
- v=e?strtoull(e,NULL,0):0xcd500000ULL+extra;if(!e&&extra)fprintf(stderr,"[totk] application pool %#llx: +%llu MiB for the bigger texture heaps (TOTK_OUTPUT_RES, TOTK_RENDER_RES)\n",(unsigned long long)v,(unsigned long long)(extra>>20));}return v;}
-/* TOTK: application memory pool reported to the game (default: retail 3.2 GiB; TOTK_OUTPUT_RES adds what its HeapDef overlay gives the texture heaps) */
+ v=e?strtoull(e,NULL,0):(dram_8gb()?0x1b3400000ULL:0xcd500000ULL)+extra;if(!e&&extra)fprintf(stderr,"[totk] application pool %#llx: +%llu MiB for the bigger texture heaps (TOTK_OUTPUT_RES, TOTK_RENDER_RES)\n",(unsigned long long)v,(unsigned long long)(extra>>20));}return v;}
+/* TOTK: application memory pool reported to the game (default: retail 3.2 GiB, or 6.8 GiB as in an emulator's 8 GB DRAM mode with TOTK_DRAM_8GB; TOTK_OUTPUT_RES adds what its HeapDef overlay gives the texture heaps) */
 #define ALIAS_START ((uintptr_t)alias_space)
 #define STACK_START ((uintptr_t)low_space+STACK_OFF)
 #define ASLR_START ((uintptr_t)low_space)
@@ -106,6 +114,7 @@ static uint64_t low_size(void){
  if(!v){uint64_t cap=APP_POOL>HEAP_CAP_MAX?HEAP_CAP_MAX:APP_POOL;uint64_t need=HEAP_OFF+cap+ARENA_TAIL;v=need>LOW_SIZE_MIN?need:LOW_SIZE_MIN;}
  return v;
 }
+#define LOW_SIZE low_size()   /* tests/bench/guest_address_probe.c still spells the reservation this way */
 static uint64_t heap_cap(void){
  uint64_t by_pool=APP_POOL>runtime_image_bytes()?APP_POOL-runtime_image_bytes():0;
  uint64_t cap=by_pool>HEAP_CAP_DEFAULT?by_pool:HEAP_CAP_DEFAULT;
@@ -745,3 +754,4 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
 #ifdef GAME_BOTW
 #undef runtime_svc
 #endif
+#include "mem_scan.h"   /* Mac diagnostics: mscan commands (memory scan, write watch) */
