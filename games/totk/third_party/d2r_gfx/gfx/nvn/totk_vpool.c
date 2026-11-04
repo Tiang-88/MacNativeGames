@@ -3,7 +3,8 @@
 // (copy=FALSE), so CPU and GPU writes through either view hit the same physical pages.
 // Physical pools marked CPU_NO_ACCESS cannot be observed except through virtual mappings, so they get
 // 16 KiB-aligned host storage (game storage may be only 4/8 KiB aligned, which Darwin cannot remap).
-// CPU-visible physical pools must alias the game storage itself and therefore must be 16 KiB aligned.
+// CPU-visible physical pools alias the game storage itself when it starts on a host page; otherwise they get
+// aligned host storage of their own (a mod's pool may be aligned only to 8 KiB, which Darwin cannot remap).
 #include "totk_vpool.h"
 #include "nvn_mtl.h"
 #include "nvn_dirty.h"
@@ -38,13 +39,16 @@ int totk_vpool_init(pool_t *o) {
     if (!o->size || o->size % TOTK_VPOOL_PAGE) { LOG("【红】vpool: pool size %#llx not a multiple of 64 KiB", o->size); return 0; }
     if (virt && o->mem) { LOG("【红】vpool: virtual pool given storage %p", (void *)o->mem); return 0; }
     if (phys && !o->mem) { LOG("【红】vpool: physical pool without storage"); return 0; }
-    if (phys && !(o->flags & F_CPU_NO_ACCESS)) {
-        if ((uintptr_t)o->mem % host_page()) { LOG("【红】vpool: CPU-visible physical pool %p not %#llx aligned; cannot alias", (void *)o->mem, host_page()); return 0; }
-        return 1;   // aliases the game storage directly
-    }
+    /* A CPU-visible physical pool normally aliases the game's own storage, which needs it to start on a host page.
+       A mod's pool does not: UltraCam's ImGui backend hands over storage its allocator aligned only to 8 KiB, and
+       Darwin cannot remap a range that starts mid-page, so refusing it left the mod with no backing at all and its
+       text drawn from empty memory. Give such a pool aligned storage of its own instead: nvnMemoryPoolMap returns
+       this address to the guest, so the mod's writes and the virtual mappings over it all land on these pages. */
+    if (phys && !(o->flags & F_CPU_NO_ACCESS) && !((uintptr_t)o->mem % host_page())) return 1;   // aliases the game storage directly
     o->span = round_up(o->size, host_page());
     o->host = vm_fresh(o->span);
     if (!o->host) return 0;
+    if (phys) memcpy(o->host, o->mem, o->size);   // whatever the caller already wrote into its own storage
     o->mem = o->host;
     return 1;
 }
