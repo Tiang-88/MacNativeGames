@@ -133,8 +133,11 @@ static unsigned show_keyboard(void *out_string, const void *arg_ptr) {
     char text[KB_LIMIT * 4 + 1] = ""; int confirmed = 0;
     const char *forced = getenv("TOTK_SWKBD_ANSWER");
     if (forced) {
+        /* One shot: the answer exists to fill the mod's server-address bar at boot. Left set, it also filled the chat
+           input the multiplayer mod opens on A+X, sending the address as a chat message. Later keyboards get the bar. */
         confirmed = strcmp(forced, "<cancel>") != 0;
         snprintf(text, sizeof text, "%s", strcmp(forced, "<initial>") ? forced : initial);
+        unsetenv("TOTK_SWKBD_ANSWER");
     } else {
 #if TARGET_OS_OSX
         RuntimeTextRequest req = { prompt, initial, max_len, min_len, password != 0, type == KB_TYPE_NUMPAD, disabled };
